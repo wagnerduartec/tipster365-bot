@@ -4,20 +4,18 @@ import OpenAI from "openai";
 const telegramToken = process.env.TELEGRAM_TOKEN;
 const openaiKey = process.env.OPENAI_API_KEY;
 const oddsApiKey = process.env.ODDS_API_KEY;
-
-// Você pode trocar depois para outro esporte.
-// Exemplos:
-// soccer_epl
-// soccer_brazil_campeonato
-// basketball_nba
-const sportKey = process.env.SPORT_KEY || "soccer_epl";
+const sportKey = process.env.SPORT_KEY; // mantenha o que você já usa no Railway
 
 if (!telegramToken) throw new Error("Falta a variável TELEGRAM_TOKEN");
 if (!openaiKey) throw new Error("Falta a variável OPENAI_API_KEY");
 if (!oddsApiKey) throw new Error("Falta a variável ODDS_API_KEY");
+if (!sportKey) throw new Error("Falta a variável SPORT_KEY");
 
 const bot = new TelegramBot(telegramToken, { polling: true });
 const client = new OpenAI({ apiKey: openaiKey });
+
+// Guarda quem está no fluxo de informar data
+const pendingDateInput = new Map();
 
 function formatDateBR(isoDate) {
   try {
@@ -34,23 +32,49 @@ function formatDateBR(isoDate) {
   }
 }
 
+function isValidDateInput(dateStr) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(dateStr);
+}
+
+function toUtcRangeFromFortalezaDate(dateStr) {
+  // Fortaleza = UTC-3, sem horário de verão
+  const start = new Date(`${dateStr}T00:00:00-03:00`).toISOString();
+  const end = new Date(`${dateStr}T23:59:59-03:00`).toISOString();
+  return { start, end };
+}
+
+function isPastDate(dateStr) {
+  const now = new Date();
+  const todayFortaleza = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Fortaleza",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(now);
+
+  return dateStr < todayFortaleza;
+}
+
 async function sendLongMessage(chatId, text) {
   const chunkSize = 3500;
   if (!text) return;
 
   for (let i = 0; i < text.length; i += chunkSize) {
-    const chunk = text.slice(i, i + chunkSize);
-    await bot.sendMessage(chatId, chunk);
+    await bot.sendMessage(chatId, text.slice(i, i + chunkSize));
   }
 }
 
-async function buscarOddsReais() {
+async function buscarOddsPorData(dateStr) {
+  const { start, end } = toUtcRangeFromFortalezaDate(dateStr);
+
   const url =
     `https://api.the-odds-api.com/v4/sports/${sportKey}/odds` +
     `?apiKey=${oddsApiKey}` +
     `&regions=eu` +
-    `&markets=h2h` +
-    `&oddsFormat=decimal`;
+    `&markets=h2h,totals` +
+    `&oddsFormat=decimal` +
+    `&commenceTimeFrom=${encodeURIComponent(start)}` +
+    `&commenceTimeTo=${encodeURIComponent(end)}`;
 
   const response = await fetch(url);
 
@@ -59,50 +83,90 @@ async function buscarOddsReais() {
     throw new Error(`Erro API Odds: ${response.status} - ${errorText}`);
   }
 
-  const data = await response.json();
-  return data;
+  return await response.json();
+}
+
+function getBestH2H(bookmakers, homeTeam, awayTeam) {
+  const best = {
+    home: null,
+    draw: null,
+    away: null,
+  };
+
+  for (const bookmaker of bookmakers || []) {
+    const market = (bookmaker.markets || []).find((m) => m.key === "h2h");
+    if (!market) continue;
+
+    for (const outcome of market.outcomes || []) {
+      const item = {
+        bookmaker: bookmaker.title,
+        name: outcome.name,
+        price: outcome.price,
+      };
+
+      if (outcome.name === homeTeam) {
+        if (!best.home || outcome.price > best.home.price) best.home = item;
+      } else if (outcome.name === awayTeam) {
+        if (!best.away || outcome.price > best.away.price) best.away = item;
+      } else if (
+        outcome.name.toLowerCase() === "draw" ||
+        outcome.name.toLowerCase() === "empate"
+      ) {
+        if (!best.draw || outcome.price > best.draw.price) best.draw = item;
+      }
+    }
+  }
+
+  return best;
+}
+
+function getBestTotals(bookmakers) {
+  const best = {
+    over: null,
+    under: null,
+  };
+
+  for (const bookmaker of bookmakers || []) {
+    const market = (bookmaker.markets || []).find((m) => m.key === "totals");
+    if (!market) continue;
+
+    for (const outcome of market.outcomes || []) {
+      const item = {
+        bookmaker: bookmaker.title,
+        name: outcome.name,
+        price: outcome.price,
+        point: outcome.point,
+      };
+
+      if (outcome.name.toLowerCase() === "over") {
+        if (!best.over || outcome.price > best.over.price) best.over = item;
+      }
+
+      if (outcome.name.toLowerCase() === "under") {
+        if (!best.under || outcome.price > best.under.price) best.under = item;
+      }
+    }
+  }
+
+  return best;
 }
 
 function resumirJogos(oddsData) {
-  return oddsData.slice(0, 10).map((game) => {
-    const bookmaker = game.bookmakers?.[0];
-    const market = bookmaker?.markets?.[0];
-
-    const outcomes =
-      market?.outcomes?.map((outcome) => ({
-        name: outcome.name,
-        price: outcome.price,
-      })) || [];
+  return (oddsData || []).map((game) => {
+    const bestH2H = getBestH2H(game.bookmakers, game.home_team, game.away_team);
+    const bestTotals = getBestTotals(game.bookmakers);
 
     return {
-      sport: game.sport_title || "N/D",
+      event_id: game.id,
+      sport: game.sport_title,
       commence_time: game.commence_time,
-      home_team: game.home_team || "Mandante",
-      away_team: game.away_team || "Visitante",
-      bookmaker: bookmaker?.title || "N/D",
-      odds: outcomes,
+      home_team: game.home_team,
+      away_team: game.away_team,
+      bookmakers_count: (game.bookmakers || []).length,
+      h2h: bestH2H,
+      totals: bestTotals,
     };
   });
-}
-
-function formatarJogosTexto(jogos) {
-  if (!jogos.length) return "Nenhum jogo encontrado.";
-
-  return jogos
-    .map((jogo, index) => {
-      const oddsTexto = jogo.odds.length
-        ? jogo.odds.map((o) => `${o.name}: ${o.price}`).join(" | ")
-        : "Sem odds disponíveis";
-
-      return [
-        `${index + 1}. ${jogo.home_team} x ${jogo.away_team}`,
-        `Esporte: ${jogo.sport}`,
-        `Horário: ${formatDateBR(jogo.commence_time)}`,
-        `Casa: ${jogo.bookmaker}`,
-        `Odds: ${oddsTexto}`,
-      ].join("\n");
-    })
-    .join("\n\n");
 }
 
 bot.onText(/\/start/, async (msg) => {
@@ -110,71 +174,93 @@ bot.onText(/\/start/, async (msg) => {
     "🤖 Tipster365 ativo.",
     "",
     "Comandos disponíveis:",
-    "/jogos - lista jogos e odds reais",
-    "/analise - análise com base em dados reais",
-    "/bilhete - modelo de bilhete com base nos jogos reais",
+    "/analise - pede a data e retorna as 5 melhores entradas",
+    "",
+    "Formato da data: AAAA-MM-DD",
+    "Exemplo: 2026-03-21",
   ].join("\n");
 
   await bot.sendMessage(msg.chat.id, texto);
 });
 
-bot.onText(/\/jogos/, async (msg) => {
-  const chatId = msg.chat.id;
-
-  try {
-    await bot.sendMessage(chatId, "⏳ Buscando jogos reais...");
-
-    const odds = await buscarOddsReais();
-    const jogos = resumirJogos(odds);
-
-    if (!jogos.length) {
-      await bot.sendMessage(chatId, "Nenhum jogo encontrado no momento.");
-      return;
-    }
-
-    const texto = `📋 Jogos encontrados para ${sportKey}:\n\n${formatarJogosTexto(jogos)}`;
-    await sendLongMessage(chatId, texto);
-  } catch (error) {
-    console.error("Erro /jogos:", error);
-    await bot.sendMessage(chatId, "❌ Erro ao buscar jogos reais.");
-  }
-});
-
 bot.onText(/\/analise/, async (msg) => {
+  pendingDateInput.set(msg.chat.id, true);
+
+  await bot.sendMessage(
+    msg.chat.id,
+    "📅 Me envie a data que você quer analisar no formato AAAA-MM-DD.\nExemplo: 2026-03-21"
+  );
+});
+
+bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
+  const text = (msg.text || "").trim();
+
+  if (!pendingDateInput.get(chatId)) return;
+  if (text.startsWith("/")) return;
+
+  pendingDateInput.delete(chatId);
+
+  if (!isValidDateInput(text)) {
+    await bot.sendMessage(
+      chatId,
+      "❌ Data inválida. Use o formato AAAA-MM-DD.\nExemplo: 2026-03-21"
+    );
+    return;
+  }
+
+  if (isPastDate(text)) {
+    await bot.sendMessage(
+      chatId,
+      "❌ Essa data está no passado. Nesta versão simples, com o endpoint atual, eu consigo analisar hoje ou datas futuras. Para passado, a API histórica normalmente exige plano pago."
+    );
+    return;
+  }
 
   try {
-    await bot.sendMessage(chatId, "⏳ Buscando jogos reais e gerando análise...");
+    await bot.sendMessage(chatId, `⏳ Buscando jogos e analisando ${text}...`);
 
-    const odds = await buscarOddsReais();
+    const odds = await buscarOddsPorData(text);
     const jogos = resumirJogos(odds);
 
     if (!jogos.length) {
-      await bot.sendMessage(chatId, "Nenhum jogo encontrado para análise.");
+      await bot.sendMessage(chatId, "Nenhum jogo encontrado para essa data.");
       return;
     }
 
     const prompt = `
-Você é um analista esportivo profissional.
+Você é um analista profissional de apostas esportivas.
+
+Tarefa:
+Analisar SOMENTE os dados reais fornecidos abaixo e retornar as 5 melhores entradas do dia.
 
 Regras obrigatórias:
-- Use SOMENTE os dados reais fornecidos abaixo.
-- Não invente jogos, odds, horários, mercados ou resultados.
-- Se os dados forem insuficientes, diga isso claramente.
+- Use somente os mercados H2H e OVER/UNDER (totals).
+- Não invente jogos, odds, linhas, horários ou mercados.
+- Não invente contexto estatístico externo.
+- Se os dados forem insuficientes, diga isso.
+- Seja objetivo.
 - Responda em português do Brasil.
-- Seja objetivo, claro e organizado.
-- Não afirme certeza de ganho.
-- Trate a resposta como análise probabilística e educacional.
+- Considere como "melhores entradas" as opções mais sólidas e coerentes com as odds e linhas disponíveis.
+- Se houver menos de 5 boas entradas, retorne apenas as que fizerem sentido.
 
-Quero o seguinte formato:
+Formato exato da resposta:
+1. Data analisada
+2. Resumo curto do cenário do dia
+3. Top 5 entradas do dia
 
-1. Cenário geral do dia
-2. Mercados mais conservadores observáveis
-3. Top 5 oportunidades mais conservadoras
-4. Top 3 oportunidades mais agressivas
-5. 1 bilhete conservador
-6. 1 bilhete agressivo
-7. Aviso final de risco
+Para cada entrada, use este formato:
+- Jogo:
+- Horário:
+- Mercado:
+- Entrada:
+- Odd:
+- Casa:
+- Justificativa curta:
+
+4. Observação final de risco
+
+Data solicitada: ${text}
 
 Dados reais:
 ${JSON.stringify(jogos, null, 2)}
@@ -185,61 +271,17 @@ ${JSON.stringify(jogos, null, 2)}
       input: prompt,
     });
 
-    const texto = response.output_text || "Não consegui gerar a análise.";
-    await sendLongMessage(chatId, texto);
+    const textoResposta =
+      response.output_text || "Não consegui gerar a análise.";
+
+    await sendLongMessage(chatId, textoResposta);
   } catch (error) {
-    console.error("Erro /analise:", error);
-    await bot.sendMessage(chatId, "❌ Erro ao gerar análise com dados reais.");
+    console.error("Erro no fluxo de data /analise:", error);
+    await bot.sendMessage(
+      chatId,
+      "❌ Erro ao gerar a análise da data informada."
+    );
   }
 });
 
-bot.onText(/\/bilhete/, async (msg) => {
-  const chatId = msg.chat.id;
-
-  try {
-    await bot.sendMessage(chatId, "⏳ Montando bilhete com base nos jogos reais...");
-
-    const odds = await buscarOddsReais();
-    const jogos = resumirJogos(odds);
-
-    if (!jogos.length) {
-      await bot.sendMessage(chatId, "Nenhum jogo encontrado para montar o bilhete.");
-      return;
-    }
-
-    const prompt = `
-Você é um analista esportivo profissional.
-
-Regras obrigatórias:
-- Use SOMENTE os dados reais fornecidos.
-- Não invente jogos, odds, horários, mercados ou resultados.
-- Se os dados forem insuficientes, diga isso claramente.
-- Responda em português do Brasil.
-- Seja direto, objetivo e profissional.
-- Não trate como garantia de ganho.
-
-Monte:
-1. Bilhete conservador
-2. Faixa de odds sugerida
-3. Gestão de banca sugerida
-4. Bilhete mais agressivo
-5. Aviso final
-
-Dados reais:
-${JSON.stringify(jogos, null, 2)}
-`;
-
-    const response = await client.responses.create({
-      model: "gpt-5.4",
-      input: prompt,
-    });
-
-    const texto = response.output_text || "Não consegui gerar o bilhete.";
-    await sendLongMessage(chatId, texto);
-  } catch (error) {
-    console.error("Erro /bilhete:", error);
-    await bot.sendMessage(chatId, "❌ Erro ao gerar o bilhete com dados reais.");
-  }
-});
-
-console.log(`Bot iniciado com polling ativo. Esporte atual: ${sportKey}`);
+console.log(`Bot iniciado com polling ativo. SPORT_KEY atual: ${sportKey}`);
