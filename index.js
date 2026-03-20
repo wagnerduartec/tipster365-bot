@@ -3,117 +3,243 @@ import OpenAI from "openai";
 
 const telegramToken = process.env.TELEGRAM_TOKEN;
 const openaiKey = process.env.OPENAI_API_KEY;
+const oddsApiKey = process.env.ODDS_API_KEY;
 
-if (!telegramToken || telegramToken === "COLOCAR_AQUI_SEU_TOKEN_TELEGRAM") {
-  throw new Error("❌ Falta a variável TELEGRAM_TOKEN. Configure no Railway.");
-}
+// Você pode trocar depois para outro esporte.
+// Exemplos:
+// soccer_epl
+// soccer_brazil_campeonato
+// basketball_nba
+const sportKey = process.env.SPORT_KEY || "soccer_epl";
 
-if (!openaiKey || openaiKey === "COLOCAR_AQUI_SUA_CHAVE_OPENAI") {
-  throw new Error("❌ Falta a variável OPENAI_API_KEY. Configure no Railway.");
-}
+if (!telegramToken) throw new Error("Falta a variável TELEGRAM_TOKEN");
+if (!openaiKey) throw new Error("Falta a variável OPENAI_API_KEY");
+if (!oddsApiKey) throw new Error("Falta a variável ODDS_API_KEY");
 
 const bot = new TelegramBot(telegramToken, { polling: true });
 const client = new OpenAI({ apiKey: openaiKey });
 
-console.log("✅ Tipster365 Bot iniciado com sucesso!");
+function formatDateBR(isoDate) {
+  try {
+    return new Date(isoDate).toLocaleString("pt-BR", {
+      timeZone: "America/Fortaleza",
+      day: "2-digit",
+      month: "2-digit",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch {
+    return isoDate;
+  }
+}
 
-// Comando /start
+async function sendLongMessage(chatId, text) {
+  const chunkSize = 3500;
+  if (!text) return;
+
+  for (let i = 0; i < text.length; i += chunkSize) {
+    const chunk = text.slice(i, i + chunkSize);
+    await bot.sendMessage(chatId, chunk);
+  }
+}
+
+async function buscarOddsReais() {
+  const url =
+    `https://api.the-odds-api.com/v4/sports/${sportKey}/odds` +
+    `?apiKey=${oddsApiKey}` +
+    `&regions=eu` +
+    `&markets=h2h` +
+    `&oddsFormat=decimal`;
+
+  const response = await fetch(url);
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Erro API Odds: ${response.status} - ${errorText}`);
+  }
+
+  const data = await response.json();
+  return data;
+}
+
+function resumirJogos(oddsData) {
+  return oddsData.slice(0, 10).map((game) => {
+    const bookmaker = game.bookmakers?.[0];
+    const market = bookmaker?.markets?.[0];
+
+    const outcomes =
+      market?.outcomes?.map((outcome) => ({
+        name: outcome.name,
+        price: outcome.price,
+      })) || [];
+
+    return {
+      sport: game.sport_title || "N/D",
+      commence_time: game.commence_time,
+      home_team: game.home_team || "Mandante",
+      away_team: game.away_team || "Visitante",
+      bookmaker: bookmaker?.title || "N/D",
+      odds: outcomes,
+    };
+  });
+}
+
+function formatarJogosTexto(jogos) {
+  if (!jogos.length) return "Nenhum jogo encontrado.";
+
+  return jogos
+    .map((jogo, index) => {
+      const oddsTexto = jogo.odds.length
+        ? jogo.odds.map((o) => `${o.name}: ${o.price}`).join(" | ")
+        : "Sem odds disponíveis";
+
+      return [
+        `${index + 1}. ${jogo.home_team} x ${jogo.away_team}`,
+        `Esporte: ${jogo.sport}`,
+        `Horário: ${formatDateBR(jogo.commence_time)}`,
+        `Casa: ${jogo.bookmaker}`,
+        `Odds: ${oddsTexto}`,
+      ].join("\n");
+    })
+    .join("\n\n");
+}
+
 bot.onText(/\/start/, async (msg) => {
-  const chatId = msg.chat.id;
-  await bot.sendMessage(
-    chatId,
-    "🤖 Tipster365 ativo.\n\nComandos disponíveis:\n/analise - análise do dia\n/bilhete - bilhete resumido"
-  );
+  const texto = [
+    "🤖 Tipster365 ativo.",
+    "",
+    "Comandos disponíveis:",
+    "/jogos - lista jogos e odds reais",
+    "/analise - análise com base em dados reais",
+    "/bilhete - modelo de bilhete com base nos jogos reais",
+  ].join("\n");
+
+  await bot.sendMessage(msg.chat.id, texto);
 });
 
-// Comando /analise
+bot.onText(/\/jogos/, async (msg) => {
+  const chatId = msg.chat.id;
+
+  try {
+    await bot.sendMessage(chatId, "⏳ Buscando jogos reais...");
+
+    const odds = await buscarOddsReais();
+    const jogos = resumirJogos(odds);
+
+    if (!jogos.length) {
+      await bot.sendMessage(chatId, "Nenhum jogo encontrado no momento.");
+      return;
+    }
+
+    const texto = `📋 Jogos encontrados para ${sportKey}:\n\n${formatarJogosTexto(jogos)}`;
+    await sendLongMessage(chatId, texto);
+  } catch (error) {
+    console.error("Erro /jogos:", error);
+    await bot.sendMessage(chatId, "❌ Erro ao buscar jogos reais.");
+  }
+});
+
 bot.onText(/\/analise/, async (msg) => {
   const chatId = msg.chat.id;
-  await bot.sendMessage(chatId, "⏳ Gerando análise...");
 
   try {
-    const response = await client.chat.completions.create({
-      model: "gpt-3.5-turbo",
-      messages: [
-        {
-          role: "system",
-          content:
-            "Você é um analista de apostas esportivas profissional. Sempre deixe claro quando não tiver dados reais de partidas/odds. Entregue análises educacionais e estruturadas.",
-        },
-        {
-          role: "user",
-          content: `Gere uma análise de apostas esportivas em português do Brasil com a seguinte estrutura:
+    await bot.sendMessage(chatId, "⏳ Buscando jogos reais e gerando análise...");
 
-1. **Cenário geral do dia** - visão geral do mercado
-2. **Mercados mais seguros para observar** - onde há melhor oportunidade
-3. **5 ideias de entradas conservadoras** - apostas com menor risco
-4. **3 ideias de entradas mais agressivas** - apostas com maior potencial
-5. **1 bilhete conservador** - exemplo de aposta segura
-6. **1 bilhete agressivo** - exemplo de aposta com maior risco
-7. **Aviso de responsabilidade final** - disclaimer importante
+    const odds = await buscarOddsReais();
+    const jogos = resumirJogos(odds);
 
-IMPORTANTE: Não invente odds ao vivo confirmadas. Se não tiver dados reais, deixe isso claro. Seja direto, profissional e organizado.`,
-        },
-      ],
-      max_tokens: 1500,
+    if (!jogos.length) {
+      await bot.sendMessage(chatId, "Nenhum jogo encontrado para análise.");
+      return;
+    }
+
+    const prompt = `
+Você é um analista esportivo profissional.
+
+Regras obrigatórias:
+- Use SOMENTE os dados reais fornecidos abaixo.
+- Não invente jogos, odds, horários, mercados ou resultados.
+- Se os dados forem insuficientes, diga isso claramente.
+- Responda em português do Brasil.
+- Seja objetivo, claro e organizado.
+- Não afirme certeza de ganho.
+- Trate a resposta como análise probabilística e educacional.
+
+Quero o seguinte formato:
+
+1. Cenário geral do dia
+2. Mercados mais conservadores observáveis
+3. Top 5 oportunidades mais conservadoras
+4. Top 3 oportunidades mais agressivas
+5. 1 bilhete conservador
+6. 1 bilhete agressivo
+7. Aviso final de risco
+
+Dados reais:
+${JSON.stringify(jogos, null, 2)}
+`;
+
+    const response = await client.responses.create({
+      model: "gpt-5.4",
+      input: prompt,
     });
 
-    const texto =
-      response.choices[0]?.message?.content ||
-      "Não consegui gerar a análise.";
-    const textoLimitado = texto.slice(0, 4096);
-
-    await bot.sendMessage(chatId, textoLimitado);
+    const texto = response.output_text || "Não consegui gerar a análise.";
+    await sendLongMessage(chatId, texto);
   } catch (error) {
-    console.error("❌ Erro /analise:", error.message);
-    await bot.sendMessage(chatId, "❌ Erro ao gerar a análise.");
+    console.error("Erro /analise:", error);
+    await bot.sendMessage(chatId, "❌ Erro ao gerar análise com dados reais.");
   }
 });
 
-// Comando /bilhete
 bot.onText(/\/bilhete/, async (msg) => {
   const chatId = msg.chat.id;
-  await bot.sendMessage(chatId, "⏳ Montando bilhete...");
 
   try {
-    const response = await client.chat.completions.create({
-      model: "gpt-3.5-turbo",
-      messages: [
-        {
-          role: "system",
-          content:
-            "Você é um especialista em gestão de apostas esportivas. Sempre deixe claro quando estiver usando exemplos ilustrativos.",
-        },
-        {
-          role: "user",
-          content: `Monte um exemplo de bilhete esportivo em português do Brasil com a seguinte estrutura:
+    await bot.sendMessage(chatId, "⏳ Montando bilhete com base nos jogos reais...");
 
-1. **Bilhete conservador** - exemplo com menor risco
-2. **Faixa de odds sugerida** - range recomendado
-3. **Gestão de banca** - como gerenciar o capital
-4. **Aviso final** - disclaimer importante
+    const odds = await buscarOddsReais();
+    const jogos = resumirJogos(odds);
 
-IMPORTANTE: Não invente jogos ao vivo confirmados. Se não houver base real de odds, informe que é um modelo ilustrativo. Seja objetivo e prático.`,
-        },
-      ],
-      max_tokens: 1000,
+    if (!jogos.length) {
+      await bot.sendMessage(chatId, "Nenhum jogo encontrado para montar o bilhete.");
+      return;
+    }
+
+    const prompt = `
+Você é um analista esportivo profissional.
+
+Regras obrigatórias:
+- Use SOMENTE os dados reais fornecidos.
+- Não invente jogos, odds, horários, mercados ou resultados.
+- Se os dados forem insuficientes, diga isso claramente.
+- Responda em português do Brasil.
+- Seja direto, objetivo e profissional.
+- Não trate como garantia de ganho.
+
+Monte:
+1. Bilhete conservador
+2. Faixa de odds sugerida
+3. Gestão de banca sugerida
+4. Bilhete mais agressivo
+5. Aviso final
+
+Dados reais:
+${JSON.stringify(jogos, null, 2)}
+`;
+
+    const response = await client.responses.create({
+      model: "gpt-5.4",
+      input: prompt,
     });
 
-    const texto =
-      response.choices[0]?.message?.content ||
-      "Não consegui gerar o bilhete.";
-    const textoLimitado = texto.slice(0, 4096);
-
-    await bot.sendMessage(chatId, textoLimitado);
+    const texto = response.output_text || "Não consegui gerar o bilhete.";
+    await sendLongMessage(chatId, texto);
   } catch (error) {
-    console.error("❌ Erro /bilhete:", error.message);
-    await bot.sendMessage(chatId, "❌ Erro ao gerar o bilhete.");
+    console.error("Erro /bilhete:", error);
+    await bot.sendMessage(chatId, "❌ Erro ao gerar o bilhete com dados reais.");
   }
 });
 
-// Tratamento de erros gerais
-bot.on("error", (error) => {
-  console.error("❌ Erro no bot:", error);
-});
-
-console.log("🚀 Bot aguardando mensagens...");
+console.log(`Bot iniciado com polling ativo. Esporte atual: ${sportKey}`);
