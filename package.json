@@ -7,7 +7,7 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "node-telegram-bot-api": "latest",
-    "openai": "latest"
+    "node-telegram-bot-api": "^0.66.0",
+    "openai": "^5.12.2"
   }
 }
