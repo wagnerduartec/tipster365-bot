@@ -30,33 +30,54 @@ function formatDateBR(isoDate) {
   }
 }
 
-function isValidDateInput(dateStr) {
-  return /^\d{4}-\d{2}-\d{2}$/.test(dateStr);
+function isValidDateInputBR(dateStr) {
+  return /^\d{2}\/\d{2}\/\d{4}$/.test(dateStr);
 }
 
-function todayInFortaleza() {
-  const parts = new Intl.DateTimeFormat("en-CA", {
+function parseBRDateToISO(dateStr) {
+  const [day, month, year] = dateStr.split("/");
+  return `${year}-${month}-${day}`;
+}
+
+function todayInFortalezaISO() {
+  const now = new Date();
+
+  const year = new Intl.DateTimeFormat("en-CA", {
     timeZone: "America/Fortaleza",
     year: "numeric",
+  }).format(now);
+
+  const month = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Fortaleza",
     month: "2-digit",
+  }).format(now);
+
+  const day = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Fortaleza",
     day: "2-digit",
-  }).formatToParts(new Date());
+  }).format(now);
 
-  const y = parts.find((p) => p.type === "year")?.value;
-  const m = parts.find((p) => p.type === "month")?.value;
-  const d = parts.find((p) => p.type === "day")?.value;
-
-  return `${y}-${m}-${d}`;
+  return `${year}-${month}-${day}`;
 }
 
-function isPastDate(dateStr) {
-  return dateStr < todayInFortaleza();
+function isPastDateBR(dateStr) {
+  const isoDate = parseBRDateToISO(dateStr);
+  return isoDate < todayInFortalezaISO();
 }
 
-function toUtcRangeFromFortalezaDate(dateStr) {
-  const start = new Date(`${dateStr}T00:00:00-03:00`).toISOString();
-  const end = new Date(`${dateStr}T23:59:59-03:00`).toISOString();
-  return { start, end };
+function toUtcRangeFromFortalezaDateBR(dateStr) {
+  const isoDate = parseBRDateToISO(dateStr);
+
+  const startDate = new Date(`${isoDate}T00:00:00-03:00`);
+  const endDate = new Date(`${isoDate}T23:59:59-03:00`);
+
+  const formatForOddsApi = (date) =>
+    date.toISOString().replace(/\.\d{3}Z$/, "Z");
+
+  return {
+    start: formatForOddsApi(startDate),
+    end: formatForOddsApi(endDate),
+  };
 }
 
 async function sendLongMessage(chatId, text) {
@@ -68,8 +89,8 @@ async function sendLongMessage(chatId, text) {
   }
 }
 
-async function buscarOddsPorData(dateStr) {
-  const { start, end } = toUtcRangeFromFortalezaDate(dateStr);
+async function buscarOddsPorDataBR(dateStr) {
+  const { start, end } = toUtcRangeFromFortalezaDateBR(dateStr);
 
   const params = new URLSearchParams({
     apiKey: oddsApiKey,
@@ -197,18 +218,27 @@ bot.onText(/\/start/, async (msg) => {
     [
       "🤖 Tipster365 ativo.",
       "",
-      "Use /analise para escolher uma data.",
-      "Formato: AAAA-MM-DD",
-      "Exemplo: 2026-03-21",
+      "Comandos disponíveis:",
+      "/analise - pedir análise por data",
+      "/cancelar - cancelar solicitação atual",
+      "",
+      "Formato da data: dd/mm/aaaa",
+      "Exemplo: 21/03/2026",
     ].join("\n")
   );
 });
 
+bot.onText(/\/cancelar/, async (msg) => {
+  pendingDateInput.delete(msg.chat.id);
+  await bot.sendMessage(msg.chat.id, "✅ Solicitação cancelada.");
+});
+
 bot.onText(/\/analise/, async (msg) => {
   pendingDateInput.set(msg.chat.id, true);
+
   await bot.sendMessage(
     msg.chat.id,
-    "📅 Me envie a data que você quer analisar no formato AAAA-MM-DD.\nExemplo: 2026-03-21"
+    "📅 Me envie a data que você quer analisar no formato dd/mm/aaaa.\nExemplo: 21/03/2026"
   );
 });
 
@@ -221,18 +251,18 @@ bot.on("message", async (msg) => {
 
   pendingDateInput.delete(chatId);
 
-  if (!isValidDateInput(text)) {
+  if (!isValidDateInputBR(text)) {
     await bot.sendMessage(
       chatId,
-      "❌ Data inválida. Use o formato AAAA-MM-DD.\nExemplo: 2026-03-21"
+      "❌ Data inválida. Use o formato dd/mm/aaaa.\nExemplo: 21/03/2026"
     );
     return;
   }
 
-  if (isPastDate(text)) {
+  if (isPastDateBR(text)) {
     await bot.sendMessage(
       chatId,
-      "❌ Essa data está no passado. Nesta versão simples, eu analiso hoje ou datas futuras."
+      "❌ Essa data está no passado. Nesta versão simples, eu analiso apenas hoje ou datas futuras."
     );
     return;
   }
@@ -241,7 +271,8 @@ bot.on("message", async (msg) => {
 
   try {
     await bot.sendMessage(chatId, `⏳ Buscando jogos reais para ${text}...`);
-    const odds = await buscarOddsPorData(text);
+
+    const odds = await buscarOddsPorDataBR(text);
     jogos = resumirJogos(odds);
 
     if (!jogos.length) {
@@ -271,10 +302,17 @@ Considere apenas os mercados H2H e OVER/UNDER gols.
 Não invente jogos, odds, linhas, horários ou estatísticas externas.
 Se os dados forem insuficientes, diga isso claramente.
 
-Retorne:
+Seu objetivo é retornar as 5 melhores entradas do dia solicitado, priorizando:
+- coerência entre linha e odd
+- mercados mais sólidos
+- entradas menos forçadas
+- consistência na leitura do cenário
+
+Retorne exatamente neste formato:
+
 1. Data analisada
 2. Resumo curto do cenário do dia
-3. As 5 melhores entradas do dia
+3. Top 5 entradas do dia
 
 Para cada entrada, use exatamente:
 - Jogo:
