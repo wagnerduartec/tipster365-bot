@@ -13,7 +13,7 @@ if (!oddsApiKey) throw new Error("Falta ODDS_API_KEY");
 const bot = new TelegramBot(telegramToken, { polling: true });
 const client = new OpenAI({ apiKey: openaiKey });
 
-const pendingDateInput = new Map();
+const pendingDateInput = new Set();
 
 function formatDateBR(isoDate) {
   try {
@@ -28,15 +28,6 @@ function formatDateBR(isoDate) {
   } catch {
     return isoDate;
   }
-}
-
-function isValidDateInputBR(dateStr) {
-  return /^\d{2}\/\d{2}\/\d{4}$/.test(dateStr);
-}
-
-function parseBRDateToISO(dateStr) {
-  const [day, month, year] = dateStr.split("/");
-  return `${year}-${month}-${day}`;
 }
 
 function todayInFortalezaISO() {
@@ -60,16 +51,42 @@ function todayInFortalezaISO() {
   return `${year}-${month}-${day}`;
 }
 
+function parseBRDate(dateStr) {
+  if (!/^\d{2}\/\d{2}\/\d{4}$/.test(dateStr)) return null;
+
+  const [dayStr, monthStr, yearStr] = dateStr.split("/");
+  const day = Number(dayStr);
+  const month = Number(monthStr);
+  const year = Number(yearStr);
+
+  if (!day || !month || !year) return null;
+  if (month < 1 || month > 12) return null;
+  if (day < 1 || day > 31) return null;
+
+  const testDate = new Date(Date.UTC(year, month - 1, day));
+  const valid =
+    testDate.getUTCFullYear() === year &&
+    testDate.getUTCMonth() === month - 1 &&
+    testDate.getUTCDate() === day;
+
+  if (!valid) return null;
+
+  const isoDate = `${yearStr}-${monthStr}-${dayStr}`;
+  return { isoDate, dayStr, monthStr, yearStr };
+}
+
 function isPastDateBR(dateStr) {
-  const isoDate = parseBRDateToISO(dateStr);
-  return isoDate < todayInFortalezaISO();
+  const parsed = parseBRDate(dateStr);
+  if (!parsed) return true;
+  return parsed.isoDate < todayInFortalezaISO();
 }
 
 function toUtcRangeFromFortalezaDateBR(dateStr) {
-  const isoDate = parseBRDateToISO(dateStr);
+  const parsed = parseBRDate(dateStr);
+  if (!parsed) throw new Error("Data inválida");
 
-  const startDate = new Date(`${isoDate}T00:00:00-03:00`);
-  const endDate = new Date(`${isoDate}T23:59:59-03:00`);
+  const startDate = new Date(`${parsed.isoDate}T00:00:00-03:00`);
+  const endDate = new Date(`${parsed.isoDate}T23:59:59-03:00`);
 
   const formatForOddsApi = (date) =>
     date.toISOString().replace(/\.\d{3}Z$/, "Z");
@@ -156,45 +173,94 @@ function getBestH2H(bookmakers, homeTeam, awayTeam) {
   return best;
 }
 
-function getBestTotals(bookmakers) {
-  const candidates = [];
+function getBestTotalsByLine(bookmakers) {
+  const linesMap = new Map();
 
   for (const bookmaker of bookmakers || []) {
     const market = (bookmaker.markets || []).find((m) => m.key === "totals");
     if (!market) continue;
 
     for (const outcome of market.outcomes || []) {
+      const side = outcome.name?.toLowerCase();
+      const point = outcome.point;
+
       if (
-        outcome.name?.toLowerCase() === "over" ||
-        outcome.name?.toLowerCase() === "under"
+        (side !== "over" && side !== "under") ||
+        point === undefined ||
+        point === null
       ) {
-        candidates.push({
-          bookmaker: bookmaker.title,
-          name: outcome.name,
-          price: outcome.price,
-          point: outcome.point,
+        continue;
+      }
+
+      const key = String(point);
+
+      if (!linesMap.has(key)) {
+        linesMap.set(key, {
+          point,
+          best_over: null,
+          best_under: null,
         });
+      }
+
+      const line = linesMap.get(key);
+
+      const entry = {
+        bookmaker: bookmaker.title,
+        name: outcome.name,
+        price: outcome.price,
+        point: outcome.point,
+      };
+
+      if (side === "over") {
+        if (!line.best_over || outcome.price > line.best_over.price) {
+          line.best_over = entry;
+        }
+      }
+
+      if (side === "under") {
+        if (!line.best_under || outcome.price > line.best_under.price) {
+          line.best_under = entry;
+        }
       }
     }
   }
 
-  if (!candidates.length) {
-    return { best_over: null, best_under: null };
-  }
+  const lines = Array.from(linesMap.values()).map((line) => {
+    const balanceScore =
+      line.best_over && line.best_under
+        ? Math.abs(line.best_over.price - line.best_under.price)
+        : 999;
 
-  const overs = candidates.filter((c) => c.name.toLowerCase() === "over");
-  const unders = candidates.filter((c) => c.name.toLowerCase() === "under");
+    const distanceFrom25 =
+      typeof line.point === "number" ? Math.abs(line.point - 2.5) : 999;
 
-  const best_over = overs.sort((a, b) => b.price - a.price)[0] || null;
-  const best_under = unders.sort((a, b) => b.price - a.price)[0] || null;
+    return {
+      point: line.point,
+      best_over: line.best_over,
+      best_under: line.best_under,
+      balanceScore,
+      distanceFrom25,
+    };
+  });
 
-  return { best_over, best_under };
+  lines.sort((a, b) => {
+    if (a.balanceScore !== b.balanceScore) {
+      return a.balanceScore - b.balanceScore;
+    }
+    return a.distanceFrom25 - b.distanceFrom25;
+  });
+
+  return lines.slice(0, 3).map((line) => ({
+    point: line.point,
+    best_over: line.best_over,
+    best_under: line.best_under,
+  }));
 }
 
 function resumirJogos(oddsData) {
   return (oddsData || []).slice(0, 20).map((game) => {
     const bestH2H = getBestH2H(game.bookmakers, game.home_team, game.away_team);
-    const bestTotals = getBestTotals(game.bookmakers);
+    const totalsLines = getBestTotalsByLine(game.bookmakers);
 
     return {
       jogo: `${game.home_team} x ${game.away_team}`,
@@ -207,7 +273,7 @@ function resumirJogos(oddsData) {
         empate: bestH2H.draw,
         visitante: bestH2H.away,
       },
-      totals: bestTotals,
+      totals_lines: totalsLines,
     };
   });
 }
@@ -223,7 +289,7 @@ bot.onText(/\/start/, async (msg) => {
       "/cancelar - cancelar solicitação atual",
       "",
       "Formato da data: dd/mm/aaaa",
-      "Exemplo: 21/03/2026",
+      "Exemplo: 22/03/2026",
     ].join("\n")
   );
 });
@@ -234,11 +300,11 @@ bot.onText(/\/cancelar/, async (msg) => {
 });
 
 bot.onText(/\/analise/, async (msg) => {
-  pendingDateInput.set(msg.chat.id, true);
+  pendingDateInput.add(msg.chat.id);
 
   await bot.sendMessage(
     msg.chat.id,
-    "📅 Me envie a data que você quer analisar no formato dd/mm/aaaa.\nExemplo: 21/03/2026"
+    "📅 Me envie a data que você quer analisar no formato dd/mm/aaaa.\nExemplo: 22/03/2026"
   );
 });
 
@@ -246,15 +312,15 @@ bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
   const text = (msg.text || "").trim();
 
-  if (!pendingDateInput.get(chatId)) return;
+  if (!pendingDateInput.has(chatId)) return;
   if (text.startsWith("/")) return;
 
-  pendingDateInput.delete(chatId);
+  const parsed = parseBRDate(text);
 
-  if (!isValidDateInputBR(text)) {
+  if (!parsed) {
     await bot.sendMessage(
       chatId,
-      "❌ Data inválida. Use o formato dd/mm/aaaa.\nExemplo: 21/03/2026"
+      "❌ Data inválida. Use o formato dd/mm/aaaa.\nExemplo: 22/03/2026"
     );
     return;
   }
@@ -266,6 +332,8 @@ bot.on("message", async (msg) => {
     );
     return;
   }
+
+  pendingDateInput.delete(chatId);
 
   let jogos = [];
 
@@ -297,24 +365,38 @@ bot.on("message", async (msg) => {
     const prompt = `
 Você é um analista profissional de apostas esportivas.
 
-Analise SOMENTE os dados reais abaixo.
+Analise SOMENTE os dados reais fornecidos abaixo.
 Considere apenas os mercados H2H e OVER/UNDER gols.
-Não invente jogos, odds, linhas, horários ou estatísticas externas.
+Não invente jogos, odds, linhas, horários, estatísticas externas ou contexto não fornecido.
 Se os dados forem insuficientes, diga isso claramente.
 
-Seu objetivo é retornar as 5 melhores entradas do dia solicitado, priorizando:
+Objetivo:
+Selecionar as melhores entradas do dia solicitado com base em:
+- solidez do mercado
 - coerência entre linha e odd
-- mercados mais sólidos
-- entradas menos forçadas
-- consistência na leitura do cenário
+- favoritismo mais claro no H2H
+- linhas de gols mais consistentes no Over/Under
+- evitar entradas especulativas ou forçadas
+
+Regras obrigatórias:
+- Retorne no máximo 5 entradas.
+- Não force 5 entradas se o cenário não justificar.
+- Pode retornar 3 ou 4 entradas, se forem as únicas realmente sólidas.
+- Evite repetir o mesmo jogo excessivamente.
+- Use no máximo 2 entradas por jogo.
+- Em OVER/UNDER, cite a linha explicitamente. Exemplo: Over 2.5 ou Under 2.5.
+- Ordene da melhor para a menos forte.
+- Não use justificativas genéricas como "odd interessante" ou "bom valor" sem explicar o motivo com base nos dados fornecidos.
+- Seja objetivo e específico.
 
 Retorne exatamente neste formato:
 
 1. Data analisada
 2. Resumo curto do cenário do dia
-3. Top 5 entradas do dia
+3. Top entradas do dia
 
 Para cada entrada, use exatamente:
+- Ranking:
 - Jogo:
 - Horário:
 - Mercado:
