@@ -12,78 +12,13 @@ if (!oddsApiKey) throw new Error("Falta ODDS_API_KEY");
 const bot = new TelegramBot(telegramToken, { polling: true });
 const client = new OpenAI({ apiKey: openaiKey });
 
-const SOCCER_LEAGUES = [
-  { key: "soccer_africa_cup_of_nations", label: "Africa Cup of Nations" },
-  { key: "soccer_argentina_primera_division", label: "Argentina Primera Division" },
-  { key: "soccer_australia_aleague", label: "Australia A-League" },
-  { key: "soccer_austria_bundesliga", label: "Austria Bundesliga" },
-  { key: "soccer_belgium_first_div", label: "Belgium First Division" },
-  { key: "soccer_brazil_campeonato", label: "Brasil Série A" },
-  { key: "soccer_brazil_serie_b", label: "Brasil Série B" },
-  { key: "soccer_chile_campeonato", label: "Chile Campeonato" },
-  { key: "soccer_china_superleague", label: "China Super League" },
-  { key: "soccer_denmark_superliga", label: "Denmark Superliga" },
-  { key: "soccer_efl_champ", label: "EFL Championship" },
-  { key: "soccer_england_efl_cup", label: "England EFL Cup" },
-  { key: "soccer_england_league1", label: "England League One" },
-  { key: "soccer_england_league2", label: "England League Two" },
-  { key: "soccer_epl", label: "Premier League" },
-  { key: "soccer_fa_cup", label: "FA Cup" },
-  { key: "soccer_fifa_world_cup", label: "FIFA World Cup" },
-  { key: "soccer_fifa_world_cup_qualifiers_europe", label: "World Cup Qualifiers Europe" },
-  { key: "soccer_fifa_world_cup_qualifiers_south_america", label: "World Cup Qualifiers South America" },
-  { key: "soccer_fifa_world_cup_womens", label: "FIFA World Cup Women" },
-  { key: "soccer_fifa_world_cup_winner", label: "FIFA World Cup Winner" },
-  { key: "soccer_fifa_club_world_cup", label: "FIFA Club World Cup" },
-  { key: "soccer_finland_veikkausliiga", label: "Finland Veikkausliiga" },
-  { key: "soccer_france_coupe_de_france", label: "France Coupe de France" },
-  { key: "soccer_france_ligue_one", label: "France Ligue 1" },
-  { key: "soccer_france_ligue_two", label: "France Ligue 2" },
-  { key: "soccer_germany_bundesliga", label: "Germany Bundesliga" },
-  { key: "soccer_germany_bundesliga2", label: "Germany Bundesliga 2" },
-  { key: "soccer_germany_bundesliga_women", label: "Germany Bundesliga Women" },
-  { key: "soccer_germany_dfb_pokal", label: "Germany DFB Pokal" },
-  { key: "soccer_germany_liga3", label: "Germany Liga 3" },
-  { key: "soccer_greece_super_league", label: "Greece Super League" },
-  { key: "soccer_italy_coppa_italia", label: "Italy Coppa Italia" },
-  { key: "soccer_italy_serie_a", label: "Italy Serie A" },
-  { key: "soccer_italy_serie_b", label: "Italy Serie B" },
-  { key: "soccer_japan_j_league", label: "Japan J League" },
-  { key: "soccer_korea_kleague1", label: "Korea K League 1" },
-  { key: "soccer_league_of_ireland", label: "League of Ireland" },
-  { key: "soccer_mexico_ligamx", label: "Mexico Liga MX" },
-  { key: "soccer_netherlands_eredivisie", label: "Netherlands Eredivisie" },
-  { key: "soccer_norway_eliteserien", label: "Norway Eliteserien" },
-  { key: "soccer_poland_ekstraklasa", label: "Poland Ekstraklasa" },
-  { key: "soccer_portugal_primeira_liga", label: "Portugal Primeira Liga" },
-  { key: "soccer_russia_premier_league", label: "Russia Premier League" },
-  { key: "soccer_spain_copa_del_rey", label: "Spain Copa del Rey" },
-  { key: "soccer_spain_la_liga", label: "Spain La Liga" },
-  { key: "soccer_spain_segunda_division", label: "Spain Segunda Division" },
-  { key: "soccer_saudi_arabia_pro_league", label: "Saudi Arabia Pro League" },
-  { key: "soccer_spl", label: "Scottish Premiership" },
-  { key: "soccer_sweden_allsvenskan", label: "Sweden Allsvenskan" },
-  { key: "soccer_sweden_superettan", label: "Sweden Superettan" },
-  { key: "soccer_switzerland_superleague", label: "Switzerland Super League" },
-  { key: "soccer_turkey_super_league", label: "Turkey Super League" },
-  { key: "soccer_uefa_europa_conference_league", label: "UEFA Europa Conference League" },
-  { key: "soccer_uefa_champs_league", label: "UEFA Champions League" },
-  { key: "soccer_uefa_champs_league_qualification", label: "UEFA Champions League Qualification" },
-  { key: "soccer_uefa_champs_league_women", label: "UEFA Champions League Women" },
-  { key: "soccer_uefa_europa_league", label: "UEFA Europa League" },
-  { key: "soccer_uefa_european_championship", label: "UEFA European Championship" },
-  { key: "soccer_uefa_euro_qualification", label: "UEFA Euro Qualification" },
-  { key: "soccer_uefa_nations_league", label: "UEFA Nations League" },
-  { key: "soccer_concacaf_gold_cup", label: "CONCACAF Gold Cup" },
-  { key: "soccer_concacaf_leagues_cup", label: "CONCACAF Leagues Cup" },
-  { key: "soccer_conmebol_copa_america", label: "Copa América" },
-  { key: "soccer_conmebol_copa_libertadores", label: "Copa Libertadores" },
-  { key: "soccer_conmebol_copa_sudamericana", label: "Copa Sudamericana" },
-  { key: "soccer_usa_mls", label: "MLS" },
-];
-
 const pendingRequests = new Map();
-// chatId -> { type: "analise" | "surebet", step: "date" | "league", dateStr?: string }
+// chatId -> {
+//   type: "analise" | "surebet",
+//   step: "date" | "league",
+//   dateStr?: string,
+//   leagueOptions?: [{ key, label, count }]
+// }
 
 function formatDateBR(isoDate) {
   try {
@@ -167,30 +102,117 @@ function toUtcRangeFromFortalezaDateBR(dateStr) {
   };
 }
 
-function getLeagueChoice(input) {
-  const text = input.trim();
+async function sendLongMessage(chatId, text) {
+  const chunkSize = 3500;
+  if (!text) return;
 
-  if (/^\d+$/.test(text)) {
-    const index = Number(text) - 1;
-    if (index >= 0 && index < SOCCER_LEAGUES.length) {
-      return SOCCER_LEAGUES[index];
-    }
+  for (let i = 0; i < text.length; i += chunkSize) {
+    await bot.sendMessage(chatId, text.slice(i, i + chunkSize));
   }
-
-  const direct = SOCCER_LEAGUES.find(
-    (item) => item.key.toLowerCase() === text.toLowerCase()
-  );
-
-  return direct || null;
 }
 
-function buildLeagueMessages() {
-  const lines = SOCCER_LEAGUES.map(
-    (item, index) => `${index + 1}. ${item.label} — ${item.key}`
+async function fetchJson(url, label = "REQUEST") {
+  const response = await fetch(url);
+  const rawText = await response.text();
+
+  if (!response.ok) {
+    throw new Error(`${label} ${response.status}: ${rawText}`);
+  }
+
+  try {
+    return JSON.parse(rawText);
+  } catch {
+    throw new Error(`${label}_JSON_INVALID: ${rawText}`);
+  }
+}
+
+async function buscarOddsPorDataBR(dateStr, selectedSportKey, lightweight = false) {
+  const { start, end } = toUtcRangeFromFortalezaDateBR(dateStr);
+
+  const params = new URLSearchParams({
+    apiKey: oddsApiKey,
+    regions: lightweight ? "eu" : "eu,uk,us",
+    markets: lightweight ? "h2h" : "h2h,totals",
+    oddsFormat: "decimal",
+    commenceTimeFrom: start,
+    commenceTimeTo: end,
+  });
+
+  const url = `https://api.the-odds-api.com/v4/sports/${selectedSportKey}/odds?${params.toString()}`;
+
+  console.log("Buscando odds:", url.replace(oddsApiKey, "***"));
+
+  return fetchJson(url, "ODDS_API_ERROR");
+}
+
+async function buscarLigasSoccerAtivas() {
+  const params = new URLSearchParams({
+    apiKey: oddsApiKey,
+  });
+
+  const url = `https://api.the-odds-api.com/v4/sports?${params.toString()}`;
+  console.log("Buscando esportes ativos...");
+
+  const sports = await fetchJson(url, "SPORTS_API_ERROR");
+
+  return (sports || [])
+    .filter((item) => item?.key?.startsWith("soccer_"))
+    .filter((item) => !item?.key?.endsWith("_winner"))
+    .map((item) => ({
+      key: item.key,
+      label: item.title || item.key,
+    }));
+}
+
+async function contarEventosLiga(dateStr, league) {
+  try {
+    const odds = await buscarOddsPorDataBR(dateStr, league.key, true);
+    return {
+      key: league.key,
+      label: league.label,
+      count: Array.isArray(odds) ? odds.length : 0,
+    };
+  } catch (error) {
+    console.error(`ERRO_CONTAGEM_LIGA_${league.key}:`, error.message);
+    return {
+      key: league.key,
+      label: league.label,
+      count: 0,
+    };
+  }
+}
+
+async function buscarLigasComEventosNaData(dateStr) {
+  const activeLeagues = await buscarLigasSoccerAtivas();
+  const results = [];
+  const batchSize = 5;
+
+  for (let i = 0; i < activeLeagues.length; i += batchSize) {
+    const batch = activeLeagues.slice(i, i + batchSize);
+
+    const batchResults = await Promise.all(
+      batch.map((league) => contarEventosLiga(dateStr, league))
+    );
+
+    results.push(...batchResults);
+  }
+
+  return results
+    .filter((item) => item.count > 0)
+    .sort((a, b) => {
+      if (b.count !== a.count) return b.count - a.count;
+      return a.label.localeCompare(b.label, "pt-BR");
+    });
+}
+
+function buildLeagueMessages(leagueOptions) {
+  const lines = leagueOptions.map(
+    (item, index) => `${index + 1}. ${item.label} (${item.count}) — ${item.key}`
   );
 
   const chunks = [];
-  let current = "⚽ Escolha o campeonato.\nResponda com o número ou com a key exata.\n\n";
+  let current =
+    "⚽ Escolha o campeonato.\nResponda com o número da liga desejada.\n\n";
 
   for (const line of lines) {
     if ((current + line + "\n").length > 3500) {
@@ -207,53 +229,28 @@ function buildLeagueMessages() {
   return chunks;
 }
 
-async function sendLongMessage(chatId, text) {
-  const chunkSize = 3500;
-  if (!text) return;
-
-  for (let i = 0; i < text.length; i += chunkSize) {
-    await bot.sendMessage(chatId, text.slice(i, i + chunkSize));
-  }
-}
-
-async function sendLeagueList(chatId) {
-  const messages = buildLeagueMessages();
+async function sendLeagueList(chatId, leagueOptions) {
+  const messages = buildLeagueMessages(leagueOptions);
   for (const msg of messages) {
     await bot.sendMessage(chatId, msg);
   }
 }
 
-async function buscarOddsPorDataBR(dateStr, selectedSportKey) {
-  const { start, end } = toUtcRangeFromFortalezaDateBR(dateStr);
+function getLeagueChoice(input, leagueOptions) {
+  const text = input.trim();
 
-  const params = new URLSearchParams({
-    apiKey: oddsApiKey,
-    regions: "eu,uk,us",
-    markets: "h2h,totals",
-    oddsFormat: "decimal",
-    commenceTimeFrom: start,
-    commenceTimeTo: end,
-  });
-
-  const url = `https://api.the-odds-api.com/v4/sports/${selectedSportKey}/odds?${params.toString()}`;
-
-  console.log("Buscando odds:", url.replace(oddsApiKey, "***"));
-
-  const response = await fetch(url);
-  const rawText = await response.text();
-
-  if (!response.ok) {
-    throw new Error(`ODDS_API_ERROR ${response.status}: ${rawText}`);
+  if (/^\d+$/.test(text)) {
+    const index = Number(text) - 1;
+    if (index >= 0 && index < leagueOptions.length) {
+      return leagueOptions[index];
+    }
   }
 
-  let data;
-  try {
-    data = JSON.parse(rawText);
-  } catch {
-    throw new Error(`ODDS_API_JSON_INVALID: ${rawText}`);
-  }
+  const direct = leagueOptions.find(
+    (item) => item.key.toLowerCase() === text.toLowerCase()
+  );
 
-  return data;
+  return direct || null;
 }
 
 function getBestH2H(bookmakers, homeTeam, awayTeam) {
@@ -526,8 +523,8 @@ bot.onText(/\/start/, async (msg) => {
       "🤖 Tipster365 ativo.",
       "",
       "Comandos disponíveis:",
-      "/analise - pede data e depois campeonato",
-      "/surebet - pede data e depois campeonato",
+      "/analise - pede data e depois mostra ligas com quantidade de jogos",
+      "/surebet - pede data e depois mostra ligas com quantidade de jogos",
       "/cancelar - cancelar solicitação atual",
       "",
       "Formato da data: dd/mm/aaaa",
@@ -584,27 +581,54 @@ bot.on("message", async (msg) => {
       return;
     }
 
-    pendingRequests.set(chatId, {
-      type: pending.type,
-      step: "league",
-      dateStr: text,
-    });
-
     await bot.sendMessage(
       chatId,
-      `✅ Data registrada: ${text}\nAgora escolha o campeonato.`
+      `⏳ Levantando ligas com jogos em ${text}...`
     );
-    await sendLeagueList(chatId);
+
+    try {
+      const leagueOptions = await buscarLigasComEventosNaData(text);
+
+      if (!leagueOptions.length) {
+        pendingRequests.delete(chatId);
+        await bot.sendMessage(
+          chatId,
+          `Nenhuma liga de futebol com jogos foi encontrada para ${text}.`
+        );
+        return;
+      }
+
+      pendingRequests.set(chatId, {
+        type: pending.type,
+        step: "league",
+        dateStr: text,
+        leagueOptions,
+      });
+
+      await bot.sendMessage(
+        chatId,
+        `✅ Encontrei ${leagueOptions.length} liga(s) com jogos em ${text}.`
+      );
+      await sendLeagueList(chatId, leagueOptions);
+    } catch (error) {
+      pendingRequests.delete(chatId);
+      console.error("ERRO_LISTA_LIGAS:", error);
+      await bot.sendMessage(
+        chatId,
+        "❌ Erro ao levantar as ligas da data informada. Veja os logs do Railway para o detalhe."
+      );
+    }
+
     return;
   }
 
   if (pending.step === "league") {
-    const chosenLeague = getLeagueChoice(text);
+    const chosenLeague = getLeagueChoice(text, pending.leagueOptions || []);
 
     if (!chosenLeague) {
       await bot.sendMessage(
         chatId,
-        "❌ Campeonato inválido. Responda com o número da lista ou com a key exata."
+        "❌ Campeonato inválido. Responda com o número da lista."
       );
       return;
     }
@@ -623,7 +647,7 @@ bot.on("message", async (msg) => {
         `⏳ Buscando jogos reais para ${selectedDate} em ${selectedLeagueLabel}...`
       );
 
-      const odds = await buscarOddsPorDataBR(selectedDate, selectedSportKey);
+      const odds = await buscarOddsPorDataBR(selectedDate, selectedSportKey, false);
       jogos = resumirJogos(odds);
 
       await bot.sendMessage(
@@ -752,4 +776,4 @@ ${JSON.stringify(jogos, null, 2)}
   }
 });
 
-console.log("Bot iniciado com seleção dinâmica de data e campeonato.");
+console.log("Bot iniciado com seleção de data + ligas com quantidade de eventos.");
