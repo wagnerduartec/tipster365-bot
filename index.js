@@ -4,7 +4,6 @@ import OpenAI from "openai";
 const telegramToken = process.env.TELEGRAM_TOKEN;
 const openaiKey = process.env.OPENAI_API_KEY;
 const oddsApiKey = process.env.ODDS_API_KEY;
-const sportKey = process.env.SPORT_KEY || "soccer_brazil_campeonato";
 
 if (!telegramToken) throw new Error("Falta TELEGRAM_TOKEN");
 if (!openaiKey) throw new Error("Falta OPENAI_API_KEY");
@@ -13,7 +12,78 @@ if (!oddsApiKey) throw new Error("Falta ODDS_API_KEY");
 const bot = new TelegramBot(telegramToken, { polling: true });
 const client = new OpenAI({ apiKey: openaiKey });
 
-const pendingRequests = new Map(); // chatId -> "analise" | "surebet"
+const SOCCER_LEAGUES = [
+  { key: "soccer_africa_cup_of_nations", label: "Africa Cup of Nations" },
+  { key: "soccer_argentina_primera_division", label: "Argentina Primera Division" },
+  { key: "soccer_australia_aleague", label: "Australia A-League" },
+  { key: "soccer_austria_bundesliga", label: "Austria Bundesliga" },
+  { key: "soccer_belgium_first_div", label: "Belgium First Division" },
+  { key: "soccer_brazil_campeonato", label: "Brasil Série A" },
+  { key: "soccer_brazil_serie_b", label: "Brasil Série B" },
+  { key: "soccer_chile_campeonato", label: "Chile Campeonato" },
+  { key: "soccer_china_superleague", label: "China Super League" },
+  { key: "soccer_denmark_superliga", label: "Denmark Superliga" },
+  { key: "soccer_efl_champ", label: "EFL Championship" },
+  { key: "soccer_england_efl_cup", label: "England EFL Cup" },
+  { key: "soccer_england_league1", label: "England League One" },
+  { key: "soccer_england_league2", label: "England League Two" },
+  { key: "soccer_epl", label: "Premier League" },
+  { key: "soccer_fa_cup", label: "FA Cup" },
+  { key: "soccer_fifa_world_cup", label: "FIFA World Cup" },
+  { key: "soccer_fifa_world_cup_qualifiers_europe", label: "World Cup Qualifiers Europe" },
+  { key: "soccer_fifa_world_cup_qualifiers_south_america", label: "World Cup Qualifiers South America" },
+  { key: "soccer_fifa_world_cup_womens", label: "FIFA World Cup Women" },
+  { key: "soccer_fifa_world_cup_winner", label: "FIFA World Cup Winner" },
+  { key: "soccer_fifa_club_world_cup", label: "FIFA Club World Cup" },
+  { key: "soccer_finland_veikkausliiga", label: "Finland Veikkausliiga" },
+  { key: "soccer_france_coupe_de_france", label: "France Coupe de France" },
+  { key: "soccer_france_ligue_one", label: "France Ligue 1" },
+  { key: "soccer_france_ligue_two", label: "France Ligue 2" },
+  { key: "soccer_germany_bundesliga", label: "Germany Bundesliga" },
+  { key: "soccer_germany_bundesliga2", label: "Germany Bundesliga 2" },
+  { key: "soccer_germany_bundesliga_women", label: "Germany Bundesliga Women" },
+  { key: "soccer_germany_dfb_pokal", label: "Germany DFB Pokal" },
+  { key: "soccer_germany_liga3", label: "Germany Liga 3" },
+  { key: "soccer_greece_super_league", label: "Greece Super League" },
+  { key: "soccer_italy_coppa_italia", label: "Italy Coppa Italia" },
+  { key: "soccer_italy_serie_a", label: "Italy Serie A" },
+  { key: "soccer_italy_serie_b", label: "Italy Serie B" },
+  { key: "soccer_japan_j_league", label: "Japan J League" },
+  { key: "soccer_korea_kleague1", label: "Korea K League 1" },
+  { key: "soccer_league_of_ireland", label: "League of Ireland" },
+  { key: "soccer_mexico_ligamx", label: "Mexico Liga MX" },
+  { key: "soccer_netherlands_eredivisie", label: "Netherlands Eredivisie" },
+  { key: "soccer_norway_eliteserien", label: "Norway Eliteserien" },
+  { key: "soccer_poland_ekstraklasa", label: "Poland Ekstraklasa" },
+  { key: "soccer_portugal_primeira_liga", label: "Portugal Primeira Liga" },
+  { key: "soccer_russia_premier_league", label: "Russia Premier League" },
+  { key: "soccer_spain_copa_del_rey", label: "Spain Copa del Rey" },
+  { key: "soccer_spain_la_liga", label: "Spain La Liga" },
+  { key: "soccer_spain_segunda_division", label: "Spain Segunda Division" },
+  { key: "soccer_saudi_arabia_pro_league", label: "Saudi Arabia Pro League" },
+  { key: "soccer_spl", label: "Scottish Premiership" },
+  { key: "soccer_sweden_allsvenskan", label: "Sweden Allsvenskan" },
+  { key: "soccer_sweden_superettan", label: "Sweden Superettan" },
+  { key: "soccer_switzerland_superleague", label: "Switzerland Super League" },
+  { key: "soccer_turkey_super_league", label: "Turkey Super League" },
+  { key: "soccer_uefa_europa_conference_league", label: "UEFA Europa Conference League" },
+  { key: "soccer_uefa_champs_league", label: "UEFA Champions League" },
+  { key: "soccer_uefa_champs_league_qualification", label: "UEFA Champions League Qualification" },
+  { key: "soccer_uefa_champs_league_women", label: "UEFA Champions League Women" },
+  { key: "soccer_uefa_europa_league", label: "UEFA Europa League" },
+  { key: "soccer_uefa_european_championship", label: "UEFA European Championship" },
+  { key: "soccer_uefa_euro_qualification", label: "UEFA Euro Qualification" },
+  { key: "soccer_uefa_nations_league", label: "UEFA Nations League" },
+  { key: "soccer_concacaf_gold_cup", label: "CONCACAF Gold Cup" },
+  { key: "soccer_concacaf_leagues_cup", label: "CONCACAF Leagues Cup" },
+  { key: "soccer_conmebol_copa_america", label: "Copa América" },
+  { key: "soccer_conmebol_copa_libertadores", label: "Copa Libertadores" },
+  { key: "soccer_conmebol_copa_sudamericana", label: "Copa Sudamericana" },
+  { key: "soccer_usa_mls", label: "MLS" },
+];
+
+const pendingRequests = new Map();
+// chatId -> { type: "analise" | "surebet", step: "date" | "league", dateStr?: string }
 
 function formatDateBR(isoDate) {
   try {
@@ -97,6 +167,46 @@ function toUtcRangeFromFortalezaDateBR(dateStr) {
   };
 }
 
+function getLeagueChoice(input) {
+  const text = input.trim();
+
+  if (/^\d+$/.test(text)) {
+    const index = Number(text) - 1;
+    if (index >= 0 && index < SOCCER_LEAGUES.length) {
+      return SOCCER_LEAGUES[index];
+    }
+  }
+
+  const direct = SOCCER_LEAGUES.find(
+    (item) => item.key.toLowerCase() === text.toLowerCase()
+  );
+
+  return direct || null;
+}
+
+function buildLeagueMessages() {
+  const lines = SOCCER_LEAGUES.map(
+    (item, index) => `${index + 1}. ${item.label} — ${item.key}`
+  );
+
+  const chunks = [];
+  let current = "⚽ Escolha o campeonato.\nResponda com o número ou com a key exata.\n\n";
+
+  for (const line of lines) {
+    if ((current + line + "\n").length > 3500) {
+      chunks.push(current.trim());
+      current = "";
+    }
+    current += `${line}\n`;
+  }
+
+  if (current.trim()) {
+    chunks.push(current.trim());
+  }
+
+  return chunks;
+}
+
 async function sendLongMessage(chatId, text) {
   const chunkSize = 3500;
   if (!text) return;
@@ -106,7 +216,14 @@ async function sendLongMessage(chatId, text) {
   }
 }
 
-async function buscarOddsPorDataBR(dateStr) {
+async function sendLeagueList(chatId) {
+  const messages = buildLeagueMessages();
+  for (const msg of messages) {
+    await bot.sendMessage(chatId, msg);
+  }
+}
+
+async function buscarOddsPorDataBR(dateStr, selectedSportKey) {
   const { start, end } = toUtcRangeFromFortalezaDateBR(dateStr);
 
   const params = new URLSearchParams({
@@ -118,7 +235,7 @@ async function buscarOddsPorDataBR(dateStr) {
     commenceTimeTo: end,
   });
 
-  const url = `https://api.the-odds-api.com/v4/sports/${sportKey}/odds?${params.toString()}`;
+  const url = `https://api.the-odds-api.com/v4/sports/${selectedSportKey}/odds?${params.toString()}`;
 
   console.log("Buscando odds:", url.replace(oddsApiKey, "***"));
 
@@ -345,11 +462,11 @@ function formatPercent(value) {
   return `${Number(value).toFixed(2)}%`;
 }
 
-function montarTextoSurebets(surebets, dateStr) {
+function montarTextoSurebets(surebets, dateStr, selectedSportKey, selectedLeagueLabel) {
   if (!surebets.length) {
     return [
       `📅 Data analisada: ${dateStr}`,
-      `🏆 Liga: ${sportKey}`,
+      `🏆 Liga: ${selectedLeagueLabel} (${selectedSportKey})`,
       "",
       "Nenhuma surebet H2H encontrada nesta data.",
       "",
@@ -359,7 +476,7 @@ function montarTextoSurebets(surebets, dateStr) {
 
   let texto = [
     `📅 Data analisada: ${dateStr}`,
-    `🏆 Liga: ${sportKey}`,
+    `🏆 Liga: ${selectedLeagueLabel} (${selectedSportKey})`,
     `✅ Surebets encontradas: ${surebets.length}`,
     "",
   ].join("\n");
@@ -409,14 +526,12 @@ bot.onText(/\/start/, async (msg) => {
       "🤖 Tipster365 ativo.",
       "",
       "Comandos disponíveis:",
-      "/analise - análise por data com IA",
-      "/surebet - procurar surebets H2H por data",
+      "/analise - pede data e depois campeonato",
+      "/surebet - pede data e depois campeonato",
       "/cancelar - cancelar solicitação atual",
       "",
       "Formato da data: dd/mm/aaaa",
       "Exemplo: 22/03/2026",
-      "",
-      `Liga atual: ${sportKey}`,
     ].join("\n")
   );
 });
@@ -427,7 +542,7 @@ bot.onText(/\/cancelar/, async (msg) => {
 });
 
 bot.onText(/\/analise/, async (msg) => {
-  pendingRequests.set(msg.chat.id, "analise");
+  pendingRequests.set(msg.chat.id, { type: "analise", step: "date" });
   await bot.sendMessage(
     msg.chat.id,
     "📅 Me envie a data que você quer analisar no formato dd/mm/aaaa.\nExemplo: 22/03/2026"
@@ -435,7 +550,7 @@ bot.onText(/\/analise/, async (msg) => {
 });
 
 bot.onText(/\/surebet/, async (msg) => {
-  pendingRequests.set(msg.chat.id, "surebet");
+  pendingRequests.set(msg.chat.id, { type: "surebet", step: "date" });
   await bot.sendMessage(
     msg.chat.id,
     "📅 Me envie a data para procurar surebets no formato dd/mm/aaaa.\nExemplo: 22/03/2026"
@@ -445,87 +560,126 @@ bot.onText(/\/surebet/, async (msg) => {
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
   const text = (msg.text || "").trim();
-  const pendingType = pendingRequests.get(chatId);
+  const pending = pendingRequests.get(chatId);
 
-  if (!pendingType) return;
+  if (!pending) return;
   if (text.startsWith("/")) return;
 
-  const parsed = parseBRDate(text);
+  if (pending.step === "date") {
+    const parsed = parseBRDate(text);
 
-  if (!parsed) {
-    await bot.sendMessage(
-      chatId,
-      "❌ Data inválida. Use o formato dd/mm/aaaa.\nExemplo: 22/03/2026"
-    );
-    return;
-  }
-
-  if (isPastDateBR(text)) {
-    await bot.sendMessage(
-      chatId,
-      "❌ Essa data está no passado. Nesta versão simples, eu analiso apenas hoje ou datas futuras."
-    );
-    return;
-  }
-
-  pendingRequests.delete(chatId);
-
-  let jogos = [];
-
-  try {
-    await bot.sendMessage(chatId, `⏳ Buscando jogos reais para ${text}...`);
-
-    const odds = await buscarOddsPorDataBR(text);
-    jogos = resumirJogos(odds);
-
-    await bot.sendMessage(
-      chatId,
-      `📋 Encontrei ${jogos.length} jogo(s) para ${text}.`
-    );
-
-    if (!jogos.length) {
+    if (!parsed) {
       await bot.sendMessage(
         chatId,
-        `Nenhum jogo encontrado para ${text} em ${sportKey}.`
+        "❌ Data inválida. Use o formato dd/mm/aaaa.\nExemplo: 22/03/2026"
       );
       return;
     }
-  } catch (error) {
-    console.error("ERRO_ODDS:", error);
-    await bot.sendMessage(
-      chatId,
-      "❌ Erro ao buscar os jogos da data informada. Veja os logs do Railway para o detalhe."
-    );
-    return;
-  }
 
-  if (pendingType === "surebet") {
-    try {
-      await bot.sendMessage(chatId, "🔎 Calculando surebets H2H...");
-
-      const surebets = jogos
-        .map(calcularSurebetH2H)
-        .filter(Boolean)
-        .sort((a, b) => b.margem - a.margem);
-
-      const textoSurebets = montarTextoSurebets(surebets, text);
-      await sendLongMessage(chatId, textoSurebets);
-    } catch (error) {
-      console.error("ERRO_SUREBET:", error);
+    if (isPastDateBR(text)) {
       await bot.sendMessage(
         chatId,
-        "❌ Erro ao calcular surebets. Veja os logs do Railway para o detalhe."
+        "❌ Essa data está no passado. Nesta versão simples, eu analiso apenas hoje ou datas futuras."
       );
+      return;
     }
 
+    pendingRequests.set(chatId, {
+      type: pending.type,
+      step: "league",
+      dateStr: text,
+    });
+
+    await bot.sendMessage(
+      chatId,
+      `✅ Data registrada: ${text}\nAgora escolha o campeonato.`
+    );
+    await sendLeagueList(chatId);
     return;
   }
 
-  if (pendingType === "analise") {
-    try {
-      await bot.sendMessage(chatId, "🤖 Gerando análise com IA...");
+  if (pending.step === "league") {
+    const chosenLeague = getLeagueChoice(text);
 
-      const prompt = `
+    if (!chosenLeague) {
+      await bot.sendMessage(
+        chatId,
+        "❌ Campeonato inválido. Responda com o número da lista ou com a key exata."
+      );
+      return;
+    }
+
+    pendingRequests.delete(chatId);
+
+    const selectedSportKey = chosenLeague.key;
+    const selectedLeagueLabel = chosenLeague.label;
+    const selectedDate = pending.dateStr;
+
+    let jogos = [];
+
+    try {
+      await bot.sendMessage(
+        chatId,
+        `⏳ Buscando jogos reais para ${selectedDate} em ${selectedLeagueLabel}...`
+      );
+
+      const odds = await buscarOddsPorDataBR(selectedDate, selectedSportKey);
+      jogos = resumirJogos(odds);
+
+      await bot.sendMessage(
+        chatId,
+        `📋 Encontrei ${jogos.length} jogo(s) para ${selectedDate} em ${selectedLeagueLabel}.`
+      );
+
+      if (!jogos.length) {
+        await bot.sendMessage(
+          chatId,
+          `Nenhum jogo encontrado para ${selectedDate} em ${selectedLeagueLabel} (${selectedSportKey}).`
+        );
+        return;
+      }
+    } catch (error) {
+      console.error("ERRO_ODDS:", error);
+      await bot.sendMessage(
+        chatId,
+        "❌ Erro ao buscar os jogos da data informada. Veja os logs do Railway para o detalhe."
+      );
+      return;
+    }
+
+    if (pending.type === "surebet") {
+      try {
+        await bot.sendMessage(chatId, "🔎 Calculando surebets H2H...");
+
+        const surebets = jogos
+          .map(calcularSurebetH2H)
+          .filter(Boolean)
+          .sort((a, b) => b.margem - a.margem);
+
+        const textoSurebets = montarTextoSurebets(
+          surebets,
+          selectedDate,
+          selectedSportKey,
+          selectedLeagueLabel
+        );
+
+        await sendLongMessage(chatId, textoSurebets);
+      } catch (error) {
+        console.error("ERRO_SUREBET:", error);
+        await bot.sendMessage(
+          chatId,
+          "❌ Erro ao calcular surebets. Veja os logs do Railway para o detalhe."
+        );
+      }
+
+      return;
+    }
+
+    if (pending.type === "analise") {
+      try {
+        await bot.sendMessage(chatId, "🤖 Gerando análise com IA...");
+
+        const prompt = `
 Você é um analista profissional de apostas esportivas.
 
 Analise SOMENTE os dados reais fornecidos abaixo.
@@ -570,30 +724,32 @@ Para cada entrada, use exatamente:
 
 4. Observação final de risco
 
-Data analisada: ${text}
-Esporte: ${sportKey}
+Data analisada: ${selectedDate}
+Liga: ${selectedLeagueLabel}
+Sport key: ${selectedSportKey}
 
 Dados reais:
 ${JSON.stringify(jogos, null, 2)}
 `;
 
-      const response = await client.responses.create({
-        model: "gpt-5.4",
-        input: prompt,
-      });
+        const response = await client.responses.create({
+          model: "gpt-5.4",
+          input: prompt,
+        });
 
-      const textoResposta =
-        response.output_text || "Não foi possível gerar a análise.";
+        const textoResposta =
+          response.output_text || "Não foi possível gerar a análise.";
 
-      await sendLongMessage(chatId, textoResposta);
-    } catch (error) {
-      console.error("ERRO_OPENAI:", error);
-      await bot.sendMessage(
-        chatId,
-        "❌ Erro ao gerar a análise pela IA. Veja os logs do Railway para o detalhe."
-      );
+        await sendLongMessage(chatId, textoResposta);
+      } catch (error) {
+        console.error("ERRO_OPENAI:", error);
+        await bot.sendMessage(
+          chatId,
+          "❌ Erro ao gerar a análise pela IA. Veja os logs do Railway para o detalhe."
+        );
+      }
     }
   }
 });
 
-console.log(`Bot iniciado. SPORT_KEY atual: ${sportKey}`);
+console.log("Bot iniciado com seleção dinâmica de data e campeonato.");
