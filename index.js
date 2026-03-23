@@ -4,7 +4,7 @@ import OpenAI from "openai";
 const telegramToken = process.env.TELEGRAM_TOKEN;
 const openaiKey = process.env.OPENAI_API_KEY;
 const oddsApiKey = process.env.ODDS_API_KEY;
-const sportKey = process.env.SPORT_KEY || "soccer_epl";
+const sportKey = process.env.SPORT_KEY || "soccer_brazil_campeonato";
 
 if (!telegramToken) throw new Error("Falta TELEGRAM_TOKEN");
 if (!openaiKey) throw new Error("Falta OPENAI_API_KEY");
@@ -13,7 +13,7 @@ if (!oddsApiKey) throw new Error("Falta ODDS_API_KEY");
 const bot = new TelegramBot(telegramToken, { polling: true });
 const client = new OpenAI({ apiKey: openaiKey });
 
-const pendingDateInput = new Set();
+const pendingRequests = new Map(); // chatId -> "analise" | "surebet"
 
 function formatDateBR(isoDate) {
   try {
@@ -154,18 +154,18 @@ function getBestH2H(bookmakers, homeTeam, awayTeam) {
       const item = {
         bookmaker: bookmaker.title,
         name: outcome.name,
-        price: outcome.price,
+        price: Number(outcome.price),
       };
 
       if (outcome.name === homeTeam) {
-        if (!best.home || outcome.price > best.home.price) best.home = item;
+        if (!best.home || item.price > best.home.price) best.home = item;
       } else if (outcome.name === awayTeam) {
-        if (!best.away || outcome.price > best.away.price) best.away = item;
+        if (!best.away || item.price > best.away.price) best.away = item;
       } else if (
         outcome.name?.toLowerCase() === "draw" ||
         outcome.name?.toLowerCase() === "empate"
       ) {
-        if (!best.draw || outcome.price > best.draw.price) best.draw = item;
+        if (!best.draw || item.price > best.draw.price) best.draw = item;
       }
     }
   }
@@ -207,18 +207,18 @@ function getBestTotalsByLine(bookmakers) {
       const entry = {
         bookmaker: bookmaker.title,
         name: outcome.name,
-        price: outcome.price,
+        price: Number(outcome.price),
         point: outcome.point,
       };
 
       if (side === "over") {
-        if (!line.best_over || outcome.price > line.best_over.price) {
+        if (!line.best_over || entry.price > line.best_over.price) {
           line.best_over = entry;
         }
       }
 
       if (side === "under") {
-        if (!line.best_under || outcome.price > line.best_under.price) {
+        if (!line.best_under || entry.price > line.best_under.price) {
           line.best_under = entry;
         }
       }
@@ -258,7 +258,7 @@ function getBestTotalsByLine(bookmakers) {
 }
 
 function resumirJogos(oddsData) {
-  return (oddsData || []).slice(0, 20).map((game) => {
+  return (oddsData || []).slice(0, 30).map((game) => {
     const bestH2H = getBestH2H(game.bookmakers, game.home_team, game.away_team);
     const totalsLines = getBestTotalsByLine(game.bookmakers);
 
@@ -278,6 +278,130 @@ function resumirJogos(oddsData) {
   });
 }
 
+function calcularSurebetH2H(jogo) {
+  const home = jogo.h2h?.mandante;
+  const draw = jogo.h2h?.empate;
+  const away = jogo.h2h?.visitante;
+
+  if (!home || !draw || !away) return null;
+  if (!home.price || !draw.price || !away.price) return null;
+
+  const somaInversos =
+    1 / Number(home.price) +
+    1 / Number(draw.price) +
+    1 / Number(away.price);
+
+  if (somaInversos >= 1) return null;
+
+  const margem = (1 - somaInversos) * 100;
+
+  return {
+    jogo: jogo.jogo,
+    horario: jogo.horario,
+    somaInversos,
+    margem,
+    selecoes: {
+      mandante: home,
+      empate: draw,
+      visitante: away,
+    },
+  };
+}
+
+function calcularDistribuicaoStakes(oddHome, oddDraw, oddAway, totalStake = 100) {
+  const invHome = 1 / oddHome;
+  const invDraw = 1 / oddDraw;
+  const invAway = 1 / oddAway;
+  const soma = invHome + invDraw + invAway;
+
+  const stakeHome = (totalStake * invHome) / soma;
+  const stakeDraw = (totalStake * invDraw) / soma;
+  const stakeAway = (totalStake * invAway) / soma;
+
+  const retornoHome = stakeHome * oddHome;
+  const retornoDraw = stakeDraw * oddDraw;
+  const retornoAway = stakeAway * oddAway;
+
+  const retornoGarantido = Math.min(retornoHome, retornoDraw, retornoAway);
+  const lucroGarantido = retornoGarantido - totalStake;
+
+  return {
+    stakeHome,
+    stakeDraw,
+    stakeAway,
+    retornoGarantido,
+    lucroGarantido,
+  };
+}
+
+function formatMoneyBR(value) {
+  return Number(value).toLocaleString("pt-BR", {
+    style: "currency",
+    currency: "BRL",
+  });
+}
+
+function formatPercent(value) {
+  return `${Number(value).toFixed(2)}%`;
+}
+
+function montarTextoSurebets(surebets, dateStr) {
+  if (!surebets.length) {
+    return [
+      `📅 Data analisada: ${dateStr}`,
+      `🏆 Liga: ${sportKey}`,
+      "",
+      "Nenhuma surebet H2H encontrada nesta data.",
+      "",
+      "Isso significa que, com os jogos e odds disponíveis, não houve combinação de mandante/empate/visitante com soma dos inversos menor que 1.",
+    ].join("\n");
+  }
+
+  let texto = [
+    `📅 Data analisada: ${dateStr}`,
+    `🏆 Liga: ${sportKey}`,
+    `✅ Surebets encontradas: ${surebets.length}`,
+    "",
+  ].join("\n");
+
+  surebets.forEach((item, index) => {
+    const home = item.selecoes.mandante;
+    const draw = item.selecoes.empate;
+    const away = item.selecoes.visitante;
+
+    const stakes = calcularDistribuicaoStakes(
+      home.price,
+      draw.price,
+      away.price,
+      100
+    );
+
+    texto += [
+      `#${index + 1} ${item.jogo}`,
+      `Horário: ${item.horario}`,
+      `Margem de arbitragem: ${formatPercent(item.margem)}`,
+      "",
+      `Mandante: ${home.name} @ ${home.price} | Casa: ${home.bookmaker}`,
+      `Empate: ${draw.name} @ ${draw.price} | Casa: ${draw.bookmaker}`,
+      `Visitante: ${away.name} @ ${away.price} | Casa: ${away.bookmaker}`,
+      "",
+      `Exemplo de divisão para ${formatMoneyBR(100)} total:`,
+      `- Mandante: ${formatMoneyBR(stakes.stakeHome)}`,
+      `- Empate: ${formatMoneyBR(stakes.stakeDraw)}`,
+      `- Visitante: ${formatMoneyBR(stakes.stakeAway)}`,
+      `Retorno garantido estimado: ${formatMoneyBR(stakes.retornoGarantido)}`,
+      `Lucro garantido estimado: ${formatMoneyBR(stakes.lucroGarantido)}`,
+      "",
+      "Observação: confirme a odd no momento da execução, pois a arbitragem pode desaparecer rapidamente.",
+      "",
+      "----------------------------------------",
+      "",
+    ].join("\n");
+  });
+
+  return texto.trim();
+}
+
 bot.onText(/\/start/, async (msg) => {
   await bot.sendMessage(
     msg.chat.id,
@@ -285,34 +409,45 @@ bot.onText(/\/start/, async (msg) => {
       "🤖 Tipster365 ativo.",
       "",
       "Comandos disponíveis:",
-      "/analise - pedir análise por data",
+      "/analise - análise por data com IA",
+      "/surebet - procurar surebets H2H por data",
       "/cancelar - cancelar solicitação atual",
       "",
       "Formato da data: dd/mm/aaaa",
       "Exemplo: 22/03/2026",
+      "",
+      `Liga atual: ${sportKey}`,
     ].join("\n")
   );
 });
 
 bot.onText(/\/cancelar/, async (msg) => {
-  pendingDateInput.delete(msg.chat.id);
+  pendingRequests.delete(msg.chat.id);
   await bot.sendMessage(msg.chat.id, "✅ Solicitação cancelada.");
 });
 
 bot.onText(/\/analise/, async (msg) => {
-  pendingDateInput.add(msg.chat.id);
-
+  pendingRequests.set(msg.chat.id, "analise");
   await bot.sendMessage(
     msg.chat.id,
     "📅 Me envie a data que você quer analisar no formato dd/mm/aaaa.\nExemplo: 22/03/2026"
   );
 });
 
+bot.onText(/\/surebet/, async (msg) => {
+  pendingRequests.set(msg.chat.id, "surebet");
+  await bot.sendMessage(
+    msg.chat.id,
+    "📅 Me envie a data para procurar surebets no formato dd/mm/aaaa.\nExemplo: 22/03/2026"
+  );
+});
+
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
   const text = (msg.text || "").trim();
+  const pendingType = pendingRequests.get(chatId);
 
-  if (!pendingDateInput.has(chatId)) return;
+  if (!pendingType) return;
   if (text.startsWith("/")) return;
 
   const parsed = parseBRDate(text);
@@ -333,7 +468,7 @@ bot.on("message", async (msg) => {
     return;
   }
 
-  pendingDateInput.delete(chatId);
+  pendingRequests.delete(chatId);
 
   let jogos = [];
 
@@ -342,6 +477,11 @@ bot.on("message", async (msg) => {
 
     const odds = await buscarOddsPorDataBR(text);
     jogos = resumirJogos(odds);
+
+    await bot.sendMessage(
+      chatId,
+      `📋 Encontrei ${jogos.length} jogo(s) para ${text}.`
+    );
 
     if (!jogos.length) {
       await bot.sendMessage(
@@ -359,10 +499,33 @@ bot.on("message", async (msg) => {
     return;
   }
 
-  try {
-    await bot.sendMessage(chatId, "🤖 Gerando análise com IA...");
+  if (pendingType === "surebet") {
+    try {
+      await bot.sendMessage(chatId, "🔎 Calculando surebets H2H...");
 
-    const prompt = `
+      const surebets = jogos
+        .map(calcularSurebetH2H)
+        .filter(Boolean)
+        .sort((a, b) => b.margem - a.margem);
+
+      const textoSurebets = montarTextoSurebets(surebets, text);
+      await sendLongMessage(chatId, textoSurebets);
+    } catch (error) {
+      console.error("ERRO_SUREBET:", error);
+      await bot.sendMessage(
+        chatId,
+        "❌ Erro ao calcular surebets. Veja os logs do Railway para o detalhe."
+      );
+    }
+
+    return;
+  }
+
+  if (pendingType === "analise") {
+    try {
+      await bot.sendMessage(chatId, "🤖 Gerando análise com IA...");
+
+      const prompt = `
 Você é um analista profissional de apostas esportivas.
 
 Analise SOMENTE os dados reais fornecidos abaixo.
@@ -414,21 +577,22 @@ Dados reais:
 ${JSON.stringify(jogos, null, 2)}
 `;
 
-    const response = await client.responses.create({
-      model: "gpt-5.4",
-      input: prompt,
-    });
+      const response = await client.responses.create({
+        model: "gpt-5.4",
+        input: prompt,
+      });
 
-    const textoResposta =
-      response.output_text || "Não foi possível gerar a análise.";
+      const textoResposta =
+        response.output_text || "Não foi possível gerar a análise.";
 
-    await sendLongMessage(chatId, textoResposta);
-  } catch (error) {
-    console.error("ERRO_OPENAI:", error);
-    await bot.sendMessage(
-      chatId,
-      "❌ Erro ao gerar a análise pela IA. Veja os logs do Railway para o detalhe."
-    );
+      await sendLongMessage(chatId, textoResposta);
+    } catch (error) {
+      console.error("ERRO_OPENAI:", error);
+      await bot.sendMessage(
+        chatId,
+        "❌ Erro ao gerar a análise pela IA. Veja os logs do Railway para o detalhe."
+      );
+    }
   }
 });
 
