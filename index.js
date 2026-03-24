@@ -12,11 +12,13 @@ if (!oddsApiKey) throw new Error("Falta ODDS_API_KEY");
 const bot = new TelegramBot(telegramToken, { polling: true });
 const client = new OpenAI({ apiKey: openaiKey });
 
+const MAX_EVENTS_FOR_AI = 80;
+
 const pendingRequests = new Map();
 // chatId -> {
 //   type: "analise" | "surebet",
-//   step: "date" | "league",
-//   dateStr?: string,
+//   step: "period" | "league",
+//   periodInput?: string,
 //   leagueOptions?: [{ key, label, count }]
 // }
 
@@ -77,26 +79,72 @@ function parseBRDate(dateStr) {
   if (!valid) return null;
 
   const isoDate = `${yearStr}-${monthStr}-${dayStr}`;
-  return { isoDate, dayStr, monthStr, yearStr };
+
+  return {
+    original: dateStr,
+    dayStr,
+    monthStr,
+    yearStr,
+    isoDate,
+  };
 }
 
-function isPastDateBR(dateStr) {
-  const parsed = parseBRDate(dateStr);
+function parseBRDateOrRange(input) {
+  const cleaned = input.trim().replace(/\s+/g, " ");
+  const parts = cleaned.split(/\s+a\s+/i);
+
+  if (parts.length === 1) {
+    const single = parseBRDate(parts[0]);
+    if (!single) return null;
+
+    return {
+      kind: "single",
+      label: parts[0],
+      startDateBr: parts[0],
+      endDateBr: parts[0],
+      startIso: single.isoDate,
+      endIso: single.isoDate,
+    };
+  }
+
+  if (parts.length === 2) {
+    const start = parseBRDate(parts[0]);
+    const end = parseBRDate(parts[1]);
+
+    if (!start || !end) return null;
+    if (start.isoDate > end.isoDate) return null;
+
+    return {
+      kind: "range",
+      label: `${parts[0]} a ${parts[1]}`,
+      startDateBr: parts[0],
+      endDateBr: parts[1],
+      startIso: start.isoDate,
+      endIso: end.isoDate,
+    };
+  }
+
+  return null;
+}
+
+function isPastPeriodBR(input) {
+  const parsed = parseBRDateOrRange(input);
   if (!parsed) return true;
-  return parsed.isoDate < todayInFortalezaISO();
+  return parsed.startIso < todayInFortalezaISO();
 }
 
-function toUtcRangeFromFortalezaDateBR(dateStr) {
-  const parsed = parseBRDate(dateStr);
-  if (!parsed) throw new Error("Data inválida");
+function toUtcRangeFromFortalezaInput(input) {
+  const parsed = parseBRDateOrRange(input);
+  if (!parsed) throw new Error("Período inválido");
 
-  const startDate = new Date(`${parsed.isoDate}T00:00:00-03:00`);
-  const endDate = new Date(`${parsed.isoDate}T23:59:59-03:00`);
+  const startDate = new Date(`${parsed.startIso}T00:00:00-03:00`);
+  const endDate = new Date(`${parsed.endIso}T23:59:59-03:00`);
 
   const formatForOddsApi = (date) =>
     date.toISOString().replace(/\.\d{3}Z$/, "Z");
 
   return {
+    label: parsed.label,
     start: formatForOddsApi(startDate),
     end: formatForOddsApi(endDate),
   };
@@ -126,8 +174,8 @@ async function fetchJson(url, label = "REQUEST") {
   }
 }
 
-async function buscarOddsPorDataBR(dateStr, selectedSportKey, lightweight = false) {
-  const { start, end } = toUtcRangeFromFortalezaDateBR(dateStr);
+async function buscarOddsPorPeriodoBR(periodInput, selectedSportKey, lightweight = false) {
+  const { start, end } = toUtcRangeFromFortalezaInput(periodInput);
 
   const params = new URLSearchParams({
     apiKey: oddsApiKey,
@@ -164,9 +212,9 @@ async function buscarLigasSoccerAtivas() {
     }));
 }
 
-async function contarEventosLiga(dateStr, league) {
+async function contarEventosLiga(periodInput, league) {
   try {
-    const odds = await buscarOddsPorDataBR(dateStr, league.key, true);
+    const odds = await buscarOddsPorPeriodoBR(periodInput, league.key, true);
     return {
       key: league.key,
       label: league.label,
@@ -182,7 +230,7 @@ async function contarEventosLiga(dateStr, league) {
   }
 }
 
-async function buscarLigasComEventosNaData(dateStr) {
+async function buscarLigasComEventosNoPeriodo(periodInput) {
   const activeLeagues = await buscarLigasSoccerAtivas();
   const results = [];
   const batchSize = 5;
@@ -191,7 +239,7 @@ async function buscarLigasComEventosNaData(dateStr) {
     const batch = activeLeagues.slice(i, i + batchSize);
 
     const batchResults = await Promise.all(
-      batch.map((league) => contarEventosLiga(dateStr, league))
+      batch.map((league) => contarEventosLiga(periodInput, league))
     );
 
     results.push(...batchResults);
@@ -372,24 +420,26 @@ function getBestTotalsByLine(bookmakers) {
 }
 
 function resumirJogos(oddsData) {
-  return (oddsData || []).slice(0, 30).map((game) => {
-    const bestH2H = getBestH2H(game.bookmakers, game.home_team, game.away_team);
-    const totalsLines = getBestTotalsByLine(game.bookmakers);
+  return (oddsData || [])
+    .sort((a, b) => new Date(a.commence_time) - new Date(b.commence_time))
+    .map((game) => {
+      const bestH2H = getBestH2H(game.bookmakers, game.home_team, game.away_team);
+      const totalsLines = getBestTotalsByLine(game.bookmakers);
 
-    return {
-      jogo: `${game.home_team} x ${game.away_team}`,
-      horario: formatDateBR(game.commence_time),
-      home_team: game.home_team,
-      away_team: game.away_team,
-      bookmakers_count: (game.bookmakers || []).length,
-      h2h: {
-        mandante: bestH2H.home,
-        empate: bestH2H.draw,
-        visitante: bestH2H.away,
-      },
-      totals_lines: totalsLines,
-    };
-  });
+      return {
+        jogo: `${game.home_team} x ${game.away_team}`,
+        horario: formatDateBR(game.commence_time),
+        home_team: game.home_team,
+        away_team: game.away_team,
+        bookmakers_count: (game.bookmakers || []).length,
+        h2h: {
+          mandante: bestH2H.home,
+          empate: bestH2H.draw,
+          visitante: bestH2H.away,
+        },
+        totals_lines: totalsLines,
+      };
+    });
 }
 
 function calcularSurebetH2H(jogo) {
@@ -459,20 +509,20 @@ function formatPercent(value) {
   return `${Number(value).toFixed(2)}%`;
 }
 
-function montarTextoSurebets(surebets, dateStr, selectedSportKey, selectedLeagueLabel) {
+function montarTextoSurebets(surebets, periodLabel, selectedSportKey, selectedLeagueLabel) {
   if (!surebets.length) {
     return [
-      `📅 Data analisada: ${dateStr}`,
+      `📅 Período analisado: ${periodLabel}`,
       `🏆 Liga: ${selectedLeagueLabel} (${selectedSportKey})`,
       "",
-      "Nenhuma surebet H2H encontrada nesta data.",
+      "Nenhuma surebet H2H encontrada neste período.",
       "",
       "Isso significa que, com os jogos e odds disponíveis, não houve combinação de mandante/empate/visitante com soma dos inversos menor que 1.",
     ].join("\n");
   }
 
   let texto = [
-    `📅 Data analisada: ${dateStr}`,
+    `📅 Período analisado: ${periodLabel}`,
     `🏆 Liga: ${selectedLeagueLabel} (${selectedSportKey})`,
     `✅ Surebets encontradas: ${surebets.length}`,
     "",
@@ -523,12 +573,13 @@ bot.onText(/\/start/, async (msg) => {
       "🤖 Tipster365 ativo.",
       "",
       "Comandos disponíveis:",
-      "/analise - pede data e depois mostra ligas com quantidade de jogos",
-      "/surebet - pede data e depois mostra ligas com quantidade de jogos",
+      "/analise - escolher data ou período, depois a liga",
+      "/surebet - escolher data ou período, depois a liga",
       "/cancelar - cancelar solicitação atual",
       "",
-      "Formato da data: dd/mm/aaaa",
-      "Exemplo: 22/03/2026",
+      "Formatos aceitos:",
+      "22/03/2026",
+      "22/03/2026 a 25/03/2026",
     ].join("\n")
   );
 });
@@ -539,18 +590,18 @@ bot.onText(/\/cancelar/, async (msg) => {
 });
 
 bot.onText(/\/analise/, async (msg) => {
-  pendingRequests.set(msg.chat.id, { type: "analise", step: "date" });
+  pendingRequests.set(msg.chat.id, { type: "analise", step: "period" });
   await bot.sendMessage(
     msg.chat.id,
-    "📅 Me envie a data que você quer analisar no formato dd/mm/aaaa.\nExemplo: 22/03/2026"
+    "📅 Me envie uma data ou período no formato:\n22/03/2026\nou\n22/03/2026 a 25/03/2026"
   );
 });
 
 bot.onText(/\/surebet/, async (msg) => {
-  pendingRequests.set(msg.chat.id, { type: "surebet", step: "date" });
+  pendingRequests.set(msg.chat.id, { type: "surebet", step: "period" });
   await bot.sendMessage(
     msg.chat.id,
-    "📅 Me envie a data para procurar surebets no formato dd/mm/aaaa.\nExemplo: 22/03/2026"
+    "📅 Me envie uma data ou período no formato:\n22/03/2026\nou\n22/03/2026 a 25/03/2026"
   );
 });
 
@@ -562,38 +613,38 @@ bot.on("message", async (msg) => {
   if (!pending) return;
   if (text.startsWith("/")) return;
 
-  if (pending.step === "date") {
-    const parsed = parseBRDate(text);
+  if (pending.step === "period") {
+    const parsed = parseBRDateOrRange(text);
 
     if (!parsed) {
       await bot.sendMessage(
         chatId,
-        "❌ Data inválida. Use o formato dd/mm/aaaa.\nExemplo: 22/03/2026"
+        "❌ Formato inválido.\nUse:\n22/03/2026\nou\n22/03/2026 a 25/03/2026"
       );
       return;
     }
 
-    if (isPastDateBR(text)) {
+    if (isPastPeriodBR(text)) {
       await bot.sendMessage(
         chatId,
-        "❌ Essa data está no passado. Nesta versão simples, eu analiso apenas hoje ou datas futuras."
+        "❌ O período informado começa no passado. Nesta versão simples, eu analiso apenas hoje ou datas futuras."
       );
       return;
     }
 
     await bot.sendMessage(
       chatId,
-      `⏳ Levantando ligas com jogos em ${text}...`
+      `⏳ Levantando ligas com jogos em ${parsed.label}...`
     );
 
     try {
-      const leagueOptions = await buscarLigasComEventosNaData(text);
+      const leagueOptions = await buscarLigasComEventosNoPeriodo(text);
 
       if (!leagueOptions.length) {
         pendingRequests.delete(chatId);
         await bot.sendMessage(
           chatId,
-          `Nenhuma liga de futebol com jogos foi encontrada para ${text}.`
+          `Nenhuma liga de futebol com jogos foi encontrada para ${parsed.label}.`
         );
         return;
       }
@@ -601,13 +652,13 @@ bot.on("message", async (msg) => {
       pendingRequests.set(chatId, {
         type: pending.type,
         step: "league",
-        dateStr: text,
+        periodInput: text,
         leagueOptions,
       });
 
       await bot.sendMessage(
         chatId,
-        `✅ Encontrei ${leagueOptions.length} liga(s) com jogos em ${text}.`
+        `✅ Encontrei ${leagueOptions.length} liga(s) com jogos em ${parsed.label}.`
       );
       await sendLeagueList(chatId, leagueOptions);
     } catch (error) {
@@ -615,7 +666,7 @@ bot.on("message", async (msg) => {
       console.error("ERRO_LISTA_LIGAS:", error);
       await bot.sendMessage(
         chatId,
-        "❌ Erro ao levantar as ligas da data informada. Veja os logs do Railway para o detalhe."
+        "❌ Erro ao levantar as ligas do período informado. Veja os logs do Railway para o detalhe."
       );
     }
 
@@ -637,36 +688,49 @@ bot.on("message", async (msg) => {
 
     const selectedSportKey = chosenLeague.key;
     const selectedLeagueLabel = chosenLeague.label;
-    const selectedDate = pending.dateStr;
+    const selectedPeriodInput = pending.periodInput;
+    const periodData = parseBRDateOrRange(selectedPeriodInput);
+    const periodLabel = periodData?.label || selectedPeriodInput;
 
+    let odds = [];
     let jogos = [];
 
     try {
       await bot.sendMessage(
         chatId,
-        `⏳ Buscando jogos reais para ${selectedDate} em ${selectedLeagueLabel}...`
+        `⏳ Buscando jogos reais para ${periodLabel} em ${selectedLeagueLabel}...`
       );
 
-      const odds = await buscarOddsPorDataBR(selectedDate, selectedSportKey, false);
+      odds = await buscarOddsPorPeriodoBR(selectedPeriodInput, selectedSportKey, false);
       jogos = resumirJogos(odds);
+
+      const totalEventosEncontrados = Array.isArray(odds) ? odds.length : 0;
+      const eventosAnalisados = Math.min(jogos.length, MAX_EVENTS_FOR_AI);
 
       await bot.sendMessage(
         chatId,
-        `📋 Encontrei ${jogos.length} jogo(s) para ${selectedDate} em ${selectedLeagueLabel}.`
+        `📋 Encontrei ${totalEventosEncontrados} evento(s) no período.`
       );
 
       if (!jogos.length) {
         await bot.sendMessage(
           chatId,
-          `Nenhum jogo encontrado para ${selectedDate} em ${selectedLeagueLabel} (${selectedSportKey}).`
+          `Nenhum jogo encontrado para ${periodLabel} em ${selectedLeagueLabel} (${selectedSportKey}).`
         );
         return;
       }
+
+      jogos = jogos.slice(0, MAX_EVENTS_FOR_AI);
+
+      await bot.sendMessage(
+        chatId,
+        `🧠 Vou analisar ${eventosAnalisados} evento(s) para montar o resultado.`
+      );
     } catch (error) {
       console.error("ERRO_ODDS:", error);
       await bot.sendMessage(
         chatId,
-        "❌ Erro ao buscar os jogos da data informada. Veja os logs do Railway para o detalhe."
+        "❌ Erro ao buscar os jogos do período informado. Veja os logs do Railway para o detalhe."
       );
       return;
     }
@@ -682,7 +746,7 @@ bot.on("message", async (msg) => {
 
         const textoSurebets = montarTextoSurebets(
           surebets,
-          selectedDate,
+          periodLabel,
           selectedSportKey,
           selectedLeagueLabel
         );
@@ -703,6 +767,9 @@ bot.on("message", async (msg) => {
       try {
         await bot.sendMessage(chatId, "🤖 Gerando análise com IA...");
 
+        const totalEventosEncontrados = Array.isArray(odds) ? odds.length : 0;
+        const eventosAnalisados = jogos.length;
+
         const prompt = `
 Você é um analista profissional de apostas esportivas.
 
@@ -712,7 +779,7 @@ Não invente jogos, odds, linhas, horários, estatísticas externas ou contexto 
 Se os dados forem insuficientes, diga isso claramente.
 
 Objetivo:
-Selecionar as melhores entradas do dia solicitado com base em:
+Selecionar as melhores dicas de apostas do período solicitado com base em:
 - solidez do mercado
 - coerência entre linha e odd
 - favoritismo mais claro no H2H
@@ -720,23 +787,27 @@ Selecionar as melhores entradas do dia solicitado com base em:
 - evitar entradas especulativas ou forçadas
 
 Regras obrigatórias:
-- Retorne no máximo 5 entradas.
-- Não force 5 entradas se o cenário não justificar.
-- Pode retornar 3 ou 4 entradas, se forem as únicas realmente sólidas.
+- Retorne no máximo 10 dicas.
+- Não force 10 dicas se o cenário não justificar.
+- Pode retornar menos, se forem as únicas realmente viáveis.
 - Evite repetir o mesmo jogo excessivamente.
 - Use no máximo 2 entradas por jogo.
 - Em OVER/UNDER, cite a linha explicitamente. Exemplo: Over 2.5 ou Under 2.5.
 - Ordene da melhor para a menos forte.
 - Não use justificativas genéricas como "odd interessante" ou "bom valor" sem explicar o motivo com base nos dados fornecidos.
 - Seja objetivo e específico.
+- Informe exatamente quantos eventos foram analisados para chegar ao resultado.
 
 Retorne exatamente neste formato:
 
-1. Data analisada
-2. Resumo curto do cenário do dia
-3. Top entradas do dia
+1. Período analisado
+2. Liga analisada
+3. Eventos encontrados no período
+4. Eventos analisados
+5. Resumo curto do cenário do período
+6. Top dicas do período
 
-Para cada entrada, use exatamente:
+Para cada dica, use exatamente:
 - Ranking:
 - Jogo:
 - Horário:
@@ -746,11 +817,13 @@ Para cada entrada, use exatamente:
 - Casa:
 - Justificativa curta:
 
-4. Observação final de risco
+7. Observação final de risco
 
-Data analisada: ${selectedDate}
-Liga: ${selectedLeagueLabel}
+Período analisado: ${periodLabel}
+Liga analisada: ${selectedLeagueLabel}
 Sport key: ${selectedSportKey}
+Eventos encontrados no período: ${totalEventosEncontrados}
+Eventos analisados: ${eventosAnalisados}
 
 Dados reais:
 ${JSON.stringify(jogos, null, 2)}
@@ -776,4 +849,4 @@ ${JSON.stringify(jogos, null, 2)}
   }
 });
 
-console.log("Bot iniciado com seleção de data + ligas com quantidade de eventos.");
+console.log("Bot iniciado com seleção de período + ligas com quantidade de eventos.");
