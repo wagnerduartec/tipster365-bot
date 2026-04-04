@@ -12,7 +12,7 @@ if (!oddsApiKey) throw new Error("Falta ODDS_API_KEY");
 const bot = new TelegramBot(telegramToken, { polling: true });
 const client = new OpenAI({ apiKey: openaiKey });
 
-const MAX_EVENTS_FOR_AI = 300;
+const MAX_EVENTS_FOR_AI = 80;
 
 const pendingRequests = new Map();
 // chatId -> {
@@ -260,7 +260,7 @@ function buildLeagueMessages(leagueOptions) {
 
   const chunks = [];
   let current =
-    "⚽ Escolha um ou mais campeonatos.\nResponda com números separados por vírgula.\nExemplo: 1,3,5\n\n";
+    "⚽ Escolha o campeonato.\nResponda com o número da liga desejada.\n\n";
 
   for (const line of lines) {
     if ((current + line + "\n").length > 3500) {
@@ -284,41 +284,21 @@ async function sendLeagueList(chatId, leagueOptions) {
   }
 }
 
-function getLeagueChoices(input, leagueOptions) {
+function getLeagueChoice(input, leagueOptions) {
   const text = input.trim();
 
-  if (!text) return [];
-
-  const parts = text
-    .split(",")
-    .map((item) => item.trim())
-    .filter(Boolean);
-
-  const selected = [];
-  const usedKeys = new Set();
-
-  for (const part of parts) {
-    let found = null;
-
-    if (/^\d+$/.test(part)) {
-      const index = Number(part) - 1;
-      if (index >= 0 && index < leagueOptions.length) {
-        found = leagueOptions[index];
-      }
-    } else {
-      found =
-        leagueOptions.find(
-          (item) => item.key.toLowerCase() === part.toLowerCase()
-        ) || null;
-    }
-
-    if (found && !usedKeys.has(found.key)) {
-      usedKeys.add(found.key);
-      selected.push(found);
+  if (/^\d+$/.test(text)) {
+    const index = Number(text) - 1;
+    if (index >= 0 && index < leagueOptions.length) {
+      return leagueOptions[index];
     }
   }
 
-  return selected;
+  const direct = leagueOptions.find(
+    (item) => item.key.toLowerCase() === text.toLowerCase()
+  );
+
+  return direct || null;
 }
 
 function getBestH2H(bookmakers, homeTeam, awayTeam) {
@@ -439,7 +419,7 @@ function getBestTotalsByLine(bookmakers) {
   }));
 }
 
-function resumirJogos(oddsData, leagueLabel, sportKey) {
+function resumirJogos(oddsData) {
   return (oddsData || [])
     .sort((a, b) => new Date(a.commence_time) - new Date(b.commence_time))
     .map((game) => {
@@ -452,8 +432,6 @@ function resumirJogos(oddsData, leagueLabel, sportKey) {
         home_team: game.home_team,
         away_team: game.away_team,
         bookmakers_count: (game.bookmakers || []).length,
-        league_label: leagueLabel,
-        sport_key: sportKey,
         h2h: {
           mandante: bestH2H.home,
           empate: bestH2H.draw,
@@ -484,8 +462,6 @@ function calcularSurebetH2H(jogo) {
   return {
     jogo: jogo.jogo,
     horario: jogo.horario,
-    league_label: jogo.league_label,
-    sport_key: jogo.sport_key,
     somaInversos,
     margem,
     selecoes: {
@@ -533,15 +509,11 @@ function formatPercent(value) {
   return `${Number(value).toFixed(2)}%`;
 }
 
-function montarTextoSurebets(surebets, periodLabel, selectedLeagues) {
-  const ligasTexto = selectedLeagues
-    .map((item) => `${item.label} (${item.key})`)
-    .join(", ");
-
+function montarTextoSurebets(surebets, periodLabel, selectedSportKey, selectedLeagueLabel) {
   if (!surebets.length) {
     return [
       `📅 Período analisado: ${periodLabel}`,
-      `🏆 Ligas: ${ligasTexto}`,
+      `🏆 Liga: ${selectedLeagueLabel} (${selectedSportKey})`,
       "",
       "Nenhuma surebet H2H encontrada neste período.",
       "",
@@ -551,7 +523,7 @@ function montarTextoSurebets(surebets, periodLabel, selectedLeagues) {
 
   let texto = [
     `📅 Período analisado: ${periodLabel}`,
-    `🏆 Ligas: ${ligasTexto}`,
+    `🏆 Liga: ${selectedLeagueLabel} (${selectedSportKey})`,
     `✅ Surebets encontradas: ${surebets.length}`,
     "",
   ].join("\n");
@@ -570,7 +542,6 @@ function montarTextoSurebets(surebets, periodLabel, selectedLeagues) {
 
     texto += [
       `#${index + 1} ${item.jogo}`,
-      `Liga: ${item.league_label} (${item.sport_key})`,
       `Horário: ${item.horario}`,
       `Margem de arbitragem: ${formatPercent(item.margem)}`,
       "",
@@ -602,16 +573,13 @@ bot.onText(/\/start/, async (msg) => {
       "🤖 Tipster365 ativo.",
       "",
       "Comandos disponíveis:",
-      "/analise - escolher data ou período, depois uma ou mais ligas",
-      "/surebet - escolher data ou período, depois uma ou mais ligas",
+      "/analise - escolher data ou período, depois a liga",
+      "/surebet - escolher data ou período, depois a liga",
       "/cancelar - cancelar solicitação atual",
       "",
       "Formatos aceitos:",
       "22/03/2026",
       "22/03/2026 a 25/03/2026",
-      "",
-      "Para ligas múltiplas, responda por exemplo:",
-      "1,3,5",
     ].join("\n")
   );
 });
@@ -706,39 +674,37 @@ bot.on("message", async (msg) => {
   }
 
   if (pending.step === "league") {
-    const chosenLeagues = getLeagueChoices(text, pending.leagueOptions || []);
+    const chosenLeague = getLeagueChoice(text, pending.leagueOptions || []);
 
-    if (!chosenLeagues.length) {
+    if (!chosenLeague) {
       await bot.sendMessage(
         chatId,
-        "❌ Campeonato inválido. Responda com um ou mais números da lista. Exemplo: 1,3,5"
+        "❌ Campeonato inválido. Responda com o número da lista."
       );
       return;
     }
 
     pendingRequests.delete(chatId);
 
+    const selectedSportKey = chosenLeague.key;
+    const selectedLeagueLabel = chosenLeague.label;
     const selectedPeriodInput = pending.periodInput;
     const periodData = parseBRDateOrRange(selectedPeriodInput);
     const periodLabel = periodData?.label || selectedPeriodInput;
 
+    let odds = [];
     let jogos = [];
-    let totalEventosEncontrados = 0;
 
     try {
       await bot.sendMessage(
         chatId,
-        `⏳ Buscando jogos reais para ${periodLabel} nas ligas selecionadas...`
+        `⏳ Buscando jogos reais para ${periodLabel} em ${selectedLeagueLabel}...`
       );
 
-      for (const league of chosenLeagues) {
-        const odds = await buscarOddsPorPeriodoBR(selectedPeriodInput, league.key, false);
-        const jogosDaLiga = resumirJogos(odds, league.label, league.key);
+      odds = await buscarOddsPorPeriodoBR(selectedPeriodInput, selectedSportKey, false);
+      jogos = resumirJogos(odds);
 
-        totalEventosEncontrados += Array.isArray(odds) ? odds.length : 0;
-        jogos.push(...jogosDaLiga);
-      }
-
+      const totalEventosEncontrados = Array.isArray(odds) ? odds.length : 0;
       const eventosAnalisados = Math.min(jogos.length, MAX_EVENTS_FOR_AI);
 
       await bot.sendMessage(
@@ -749,7 +715,7 @@ bot.on("message", async (msg) => {
       if (!jogos.length) {
         await bot.sendMessage(
           chatId,
-          `Nenhum jogo encontrado para ${periodLabel} nas ligas selecionadas.`
+          `Nenhum jogo encontrado para ${periodLabel} em ${selectedLeagueLabel} (${selectedSportKey}).`
         );
         return;
       }
@@ -781,7 +747,8 @@ bot.on("message", async (msg) => {
         const textoSurebets = montarTextoSurebets(
           surebets,
           periodLabel,
-          chosenLeagues
+          selectedSportKey,
+          selectedLeagueLabel
         );
 
         await sendLongMessage(chatId, textoSurebets);
@@ -800,10 +767,8 @@ bot.on("message", async (msg) => {
       try {
         await bot.sendMessage(chatId, "🤖 Gerando análise com IA...");
 
+        const totalEventosEncontrados = Array.isArray(odds) ? odds.length : 0;
         const eventosAnalisados = jogos.length;
-        const ligasTexto = chosenLeagues
-          .map((item) => `${item.label} (${item.key})`)
-          .join(", ");
 
         const prompt = `
 Você é um analista profissional de apostas esportivas.
@@ -822,8 +787,8 @@ Selecionar as melhores dicas de apostas do período solicitado com base em:
 - evitar entradas especulativas ou forçadas
 
 Regras obrigatórias:
-- Retorne no máximo 30 dicas.
-- Não force 30 dicas se o cenário não justificar.
+- Retorne no máximo 10 dicas.
+- Não force 10 dicas se o cenário não justificar.
 - Pode retornar menos, se forem as únicas realmente viáveis.
 - Evite repetir o mesmo jogo excessivamente.
 - Use no máximo 2 entradas por jogo.
@@ -836,7 +801,7 @@ Regras obrigatórias:
 Retorne exatamente neste formato:
 
 1. Período analisado
-2. Ligas analisadas
+2. Liga analisada
 3. Eventos encontrados no período
 4. Eventos analisados
 5. Resumo curto do cenário do período
@@ -844,7 +809,6 @@ Retorne exatamente neste formato:
 
 Para cada dica, use exatamente:
 - Ranking:
-- Liga:
 - Jogo:
 - Horário:
 - Mercado:
@@ -856,7 +820,8 @@ Para cada dica, use exatamente:
 7. Observação final de risco
 
 Período analisado: ${periodLabel}
-Ligas analisadas: ${ligasTexto}
+Liga analisada: ${selectedLeagueLabel}
+Sport key: ${selectedSportKey}
 Eventos encontrados no período: ${totalEventosEncontrados}
 Eventos analisados: ${eventosAnalisados}
 
@@ -884,4 +849,4 @@ ${JSON.stringify(jogos, null, 2)}
   }
 });
 
-console.log("Bot iniciado com seleção de período + múltiplas ligas + análise consolidada.");
+console.log("Bot iniciado com seleção de período + ligas com quantidade de eventos.");
