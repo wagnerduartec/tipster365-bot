@@ -1,217 +1,209 @@
 import TelegramBot from "node-telegram-bot-api";
+import OpenAI from "openai";
 
 const telegramToken = process.env.TELEGRAM_TOKEN;
+const openaiKey = process.env.OPENAI_API_KEY;
 const oddsApiKey = process.env.ODDS_API_KEY;
 
 if (!telegramToken) throw new Error("Falta TELEGRAM_TOKEN");
+if (!openaiKey) throw new Error("Falta OPENAI_API_KEY");
 if (!oddsApiKey) throw new Error("Falta ODDS_API_KEY");
 
 const bot = new TelegramBot(telegramToken, { polling: true });
+const client = new OpenAI({ apiKey: openaiKey });
 
-// =========================
-// UTIL
-// =========================
+const MAX_EVENTS_FOR_AI = 80;
+
+const pendingRequests = new Map();
 
 function formatDateBR(isoDate) {
-  return new Date(isoDate).toLocaleString("pt-BR", {
-    timeZone: "America/Fortaleza",
-    day: "2-digit",
-    month: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
+  try {
+    return new Date(isoDate).toLocaleString("pt-BR", {
+      timeZone: "America/Fortaleza",
+      day: "2-digit",
+      month: "2-digit",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch {
+    return isoDate;
+  }
+}
+
+function todayInFortalezaISO() {
+  const now = new Date();
+  const year = new Intl.DateTimeFormat("en-CA", { timeZone: "America/Fortaleza", year: "numeric" }).format(now);
+  const month = new Intl.DateTimeFormat("en-CA", { timeZone: "America/Fortaleza", month: "2-digit" }).format(now);
+  const day = new Intl.DateTimeFormat("en-CA", { timeZone: "America/Fortaleza", day: "2-digit" }).format(now);
+  return `${year}-${month}-${day}`;
+}
+
+function parseBRDate(dateStr) {
+  if (!/^\d{2}\/\d{2}\/\d{4}$/.test(dateStr)) return null;
+  const [d, m, y] = dateStr.split("/");
+  return { isoDate: `${y}-${m}-${d}` };
+}
+
+function parseBRDateOrRange(input) {
+  const parts = input.split(" a ");
+  if (parts.length === 1) {
+    const d = parseBRDate(parts[0]);
+    if (!d) return null;
+    return { label: parts[0], startIso: d.isoDate, endIso: d.isoDate };
+  }
+  if (parts.length === 2) {
+    const s = parseBRDate(parts[0]);
+    const e = parseBRDate(parts[1]);
+    if (!s || !e) return null;
+    return { label: input, startIso: s.isoDate, endIso: e.isoDate };
+  }
+  return null;
+}
+
+function toUtcRangeFromFortalezaInput(input) {
+  const parsed = parseBRDateOrRange(input);
+  const start = new Date(`${parsed.startIso}T00:00:00-03:00`).toISOString();
+  const end = new Date(`${parsed.endIso}T23:59:59-03:00`).toISOString();
+  return { label: parsed.label, start, end };
 }
 
 async function fetchJson(url) {
-  const res = await fetch(url);
-  return res.json();
+  const r = await fetch(url);
+  return r.json();
 }
 
-// =========================
-// BUSCAR DADOS
-// =========================
+async function buscarOddsPorPeriodoBR(periodInput, sportKey) {
+  const { start, end } = toUtcRangeFromFortalezaInput(periodInput);
 
-async function buscarLigas() {
+  const url = `https://api.the-odds-api.com/v4/sports/${sportKey}/odds?apiKey=${oddsApiKey}&regions=eu&markets=h2h,totals&commenceTimeFrom=${start}&commenceTimeTo=${end}`;
+  return fetchJson(url);
+}
+
+async function buscarLigasSoccerAtivas() {
   const url = `https://api.the-odds-api.com/v4/sports?apiKey=${oddsApiKey}`;
-  const data = await fetchJson(url);
+  const sports = await fetchJson(url);
 
-  return data
+  return sports
     .filter(s => s.key.startsWith("soccer_"))
-    .filter(s => !s.key.endsWith("_winner"));
+    .map(s => ({ key: s.key, label: s.title }));
 }
 
-async function buscarJogosLiga(ligaKey) {
-  const url = `https://api.the-odds-api.com/v4/sports/${ligaKey}/odds/?apiKey=${oddsApiKey}&regions=eu&markets=h2h,totals`;
-
-  try {
-    return await fetchJson(url);
-  } catch {
-    return [];
-  }
+function resumirJogos(odds) {
+  return odds.map(j => ({
+    jogo: `${j.home_team} x ${j.away_team}`,
+    horario: formatDateBR(j.commence_time),
+    liga: "",
+    bookmakers_count: j.bookmakers?.length || 0,
+    totals_lines: j.bookmakers?.[0]?.markets?.find(m => m.key === "totals")?.outcomes || []
+  }));
 }
 
-// =========================
-// PROCESSAMENTO
-// =========================
+// ================= NOVAS FUNÇÕES =================
 
-function resumirJogo(game) {
-  if (!game.bookmakers?.length) return null;
+function getMultipleLeagueChoices(input, leagueOptions) {
+  const parts = input.split(",").map(p => p.trim());
+  return parts
+    .map(p => leagueOptions[Number(p) - 1])
+    .filter(Boolean);
+}
 
-  const totals = game.bookmakers[0].markets.find(m => m.key === "totals");
-  if (!totals) return null;
+function gerarScoreGlobal(jogo) {
+  const linha = jogo.totals_lines?.filter(o => o.point === 2.5);
+  if (!linha || linha.length < 2) return null;
 
-  const linha25 = totals.outcomes.filter(o => o.point === 2.5);
-  if (linha25.length < 2) return null;
-
-  const over = linha25.find(o => o.name === "Over");
-  const under = linha25.find(o => o.name === "Under");
+  const over = linha.find(o => o.name === "Over");
+  const under = linha.find(o => o.name === "Under");
 
   if (!over || !under) return null;
 
+  let score = 0;
+  const prob = (1 / over.price) / ((1 / over.price) + (1 / under.price));
+
+  if (prob > 0.6) score += 30;
+  if (over.price >= 1.5 && over.price <= 1.8) score += 30;
+  if (Math.abs(over.price - under.price) < 0.3) score += 20;
+  if (jogo.bookmakers_count >= 5) score += 20;
+
   return {
-    jogo: `${game.home_team} x ${game.away_team}`,
-    horario: formatDateBR(game.commence_time),
-    data: new Date(game.commence_time),
-    oddOver: over.price,
-    oddUnder: under.price,
-    casa: game.bookmakers[0].title,
-    casas: game.bookmakers.length
+    score,
+    mercado: "Over 2.5",
+    odd: over.price
   };
 }
 
-// =========================
-// FILTROS
-// =========================
-
-function apenasPreJogo(jogos) {
-  const agora = new Date();
-  return jogos.filter(j => j.data > agora);
-}
-
-function filtroQualidade(jogo) {
-  return jogo.casas >= 5 && jogo.oddOver && jogo.oddUnder;
-}
-
-// =========================
-// SCORE PROFISSIONAL
-// =========================
-
-function calcularScore(jogo) {
-  let score = 0;
-
-  const prob = (1 / jogo.oddOver) / ((1 / jogo.oddOver) + (1 / jogo.oddUnder));
-
-  if (prob > 0.60) score += 25;
-  if (prob > 0.65) score += 15;
-  if (prob > 0.70) score += 10;
-
-  if (jogo.oddOver >= 1.55 && jogo.oddOver <= 1.80) score += 25;
-
-  const diff = Math.abs(jogo.oddOver - jogo.oddUnder);
-  if (diff < 0.30) score += 20;
-
-  if (jogo.casas >= 10) score += 20;
-
-  return Math.min(score, 95);
-}
-
-// =========================
-// SCAN GLOBAL
-// =========================
-
-async function scanGlobal() {
-  const ligas = await buscarLigas();
-
-  let todos = [];
-
-  for (const liga of ligas) {
-    const jogos = await buscarJogosLiga(liga.key);
-
-    const processados = jogos
-      .map(resumirJogo)
-      .filter(Boolean)
-      .map(j => ({ ...j, liga: liga.title }));
-
-    todos.push(...processados);
-  }
-
-  const pre = apenasPreJogo(todos);
-
-  const analisados = pre
-    .filter(filtroQualidade)
-    .map(j => ({
-      ...j,
-      score: calcularScore(j)
-    }))
-    .filter(j => j.score >= 70)
+function gerarTop50Global(jogos) {
+  return jogos
+    .map(j => {
+      const s = gerarScoreGlobal(j);
+      if (!s) return null;
+      return { ...j, ...s };
+    })
+    .filter(Boolean)
     .sort((a, b) => b.score - a.score)
     .slice(0, 50);
-
-  return {
-    total: todos.length,
-    selecionados: analisados
-  };
 }
 
-// =========================
-// FORMATAR
-// =========================
+function formatarTopGlobal(lista) {
+  let txt = "🔥 TOP 50 OPORTUNIDADES\n\n";
 
-function formatarMensagem(resultado) {
-  let texto = `🔥 TOP 50 PRÉ-JOGOS DO DIA\n\n`;
-  texto += `📊 Jogos analisados: ${resultado.total}\n\n`;
-
-  resultado.selecionados.forEach((j, i) => {
-    texto += [
-      `${i + 1}. ${j.jogo}`,
-      `🏆 ${j.liga}`,
-      `⏰ ${j.horario}`,
-      `📊 ${j.score}%`,
-      `🎯 Over 2.5`,
-      `💰 ${j.oddOver}`,
-      "",
-    ].join("\n");
+  lista.forEach((j, i) => {
+    txt += `${i + 1}. ${j.jogo}\n🏆 ${j.liga}\n⏰ ${j.horario}\n📊 ${j.score}%\n💰 ${j.odd}\n\n`;
   });
 
-  return texto;
+  return txt;
 }
 
-async function sendLongMessage(chatId, text) {
-  const chunk = 4000;
-  for (let i = 0; i < text.length; i += chunk) {
-    await bot.sendMessage(chatId, text.slice(i, i + chunk));
-  }
-}
+// ================= BOT =================
 
-// =========================
-// TELEGRAM
-// =========================
-
-bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(
-    msg.chat.id,
-    "🤖 Tipster ativo\n\nComandos:\n/scan - ranking global do dia"
-  );
+bot.onText(/\/start/, msg => {
+  bot.sendMessage(msg.chat.id, "Use /analise");
 });
 
-bot.onText(/\/scan/, async (msg) => {
+bot.onText(/\/analise/, msg => {
+  pendingRequests.set(msg.chat.id, { step: "period" });
+  bot.sendMessage(msg.chat.id, "Digite a data:");
+});
+
+bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
+  const text = msg.text;
+  const pending = pendingRequests.get(chatId);
 
-  await bot.sendMessage(chatId, "🌍 Escaneando todos os jogos...");
+  if (!pending) return;
 
-  try {
-    const resultado = await scanGlobal();
+  if (pending.step === "period") {
+    pendingRequests.set(chatId, { step: "league", period: text });
 
-    await bot.sendMessage(chatId, "🧠 Aplicando filtro de precisão...");
+    const ligas = await buscarLigasSoccerAtivas();
 
-    const texto = formatarMensagem(resultado);
+    pendingRequests.get(chatId).ligas = ligas;
 
-    await sendLongMessage(chatId, texto);
+    let lista = ligas.map((l, i) => `${i + 1}. ${l.label}`).join("\n");
 
-  } catch (e) {
-    console.log(e);
-    bot.sendMessage(chatId, "❌ Erro ao executar scan.");
+    bot.sendMessage(chatId, "Escolha ligas (ex: 1,3,5)\n\n" + lista);
+    return;
+  }
+
+  if (pending.step === "league") {
+    const ligas = pending.ligas;
+    const selecionadas = getMultipleLeagueChoices(text, ligas);
+
+    let jogos = [];
+
+    for (const liga of selecionadas) {
+      const odds = await buscarOddsPorPeriodoBR(pending.period, liga.key);
+      const js = resumirJogos(odds).map(j => ({ ...j, liga: liga.label }));
+      jogos.push(...js);
+    }
+
+    const top = gerarTop50Global(jogos);
+    const txt = formatarTopGlobal(top);
+
+    bot.sendMessage(chatId, txt);
+
+    pendingRequests.delete(chatId);
   }
 });
 
-console.log("Bot rodando com SCAN GLOBAL + PRECISÃO...");
+console.log("🔥 Bot rodando com TOP 50 global");
