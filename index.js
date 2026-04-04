@@ -1,6 +1,5 @@
 import TelegramBot from "node-telegram-bot-api";
 import OpenAI from "openai";
-import fetch from "node-fetch";
 
 const telegramToken = process.env.TELEGRAM_TOKEN;
 const openaiKey = process.env.OPENAI_API_KEY;
@@ -13,269 +12,876 @@ if (!oddsApiKey) throw new Error("Falta ODDS_API_KEY");
 const bot = new TelegramBot(telegramToken, { polling: true });
 const client = new OpenAI({ apiKey: openaiKey });
 
-const pendingRequests = new Map();
+const MAX_EVENTS_FOR_AI = 300;
 
-// ================= DATA =================
+const pendingRequests = new Map();
+// chatId -> {
+//   type: "analise" | "surebet",
+//   step: "period" | "league",
+//   periodInput?: string,
+//   leagueOptions?: [{ key, label, count }]
+// }
 
 function formatDateBR(isoDate) {
-  return new Date(isoDate).toLocaleString("pt-BR", {
+  try {
+    return new Date(isoDate).toLocaleString("pt-BR", {
+      timeZone: "America/Fortaleza",
+      day: "2-digit",
+      month: "2-digit",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch {
+    return isoDate;
+  }
+}
+
+function todayInFortalezaISO() {
+  const now = new Date();
+
+  const year = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Fortaleza",
+    year: "numeric",
+  }).format(now);
+
+  const month = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Fortaleza",
+    month: "2-digit",
+  }).format(now);
+
+  const day = new Intl.DateTimeFormat("en-CA", {
     timeZone: "America/Fortaleza",
     day: "2-digit",
-    month: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
+  }).format(now);
+
+  return `${year}-${month}-${day}`;
 }
 
 function parseBRDate(dateStr) {
-  const [d, m, y] = dateStr.split("/");
-  return `${y}-${m}-${d}`;
-}
+  if (!/^\d{2}\/\d{2}\/\d{4}$/.test(dateStr)) return null;
 
-function toUtcRange(period) {
-  const iso = parseBRDate(period);
+  const [dayStr, monthStr, yearStr] = dateStr.split("/");
+  const day = Number(dayStr);
+  const month = Number(monthStr);
+  const year = Number(yearStr);
+
+  if (!day || !month || !year) return null;
+  if (month < 1 || month > 12) return null;
+  if (day < 1 || day > 31) return null;
+
+  const testDate = new Date(Date.UTC(year, month - 1, day));
+  const valid =
+    testDate.getUTCFullYear() === year &&
+    testDate.getUTCMonth() === month - 1 &&
+    testDate.getUTCDate() === day;
+
+  if (!valid) return null;
+
+  const isoDate = `${yearStr}-${monthStr}-${dayStr}`;
+
   return {
-    start: new Date(`${iso}T00:00:00-03:00`).toISOString(),
-    end: new Date(`${iso}T23:59:59-03:00`).toISOString(),
+    original: dateStr,
+    dayStr,
+    monthStr,
+    yearStr,
+    isoDate,
   };
 }
 
-// ================= API =================
+function parseBRDateOrRange(input) {
+  const cleaned = input.trim().replace(/\s+/g, " ");
+  const parts = cleaned.split(/\s+a\s+/i);
 
-async function fetchJson(url) {
-  const r = await fetch(url);
-  return r.json();
+  if (parts.length === 1) {
+    const single = parseBRDate(parts[0]);
+    if (!single) return null;
+
+    return {
+      kind: "single",
+      label: parts[0],
+      startDateBr: parts[0],
+      endDateBr: parts[0],
+      startIso: single.isoDate,
+      endIso: single.isoDate,
+    };
+  }
+
+  if (parts.length === 2) {
+    const start = parseBRDate(parts[0]);
+    const end = parseBRDate(parts[1]);
+
+    if (!start || !end) return null;
+    if (start.isoDate > end.isoDate) return null;
+
+    return {
+      kind: "range",
+      label: `${parts[0]} a ${parts[1]}`,
+      startDateBr: parts[0],
+      endDateBr: parts[1],
+      startIso: start.isoDate,
+      endIso: end.isoDate,
+    };
+  }
+
+  return null;
 }
 
-async function buscarOdds(period, sportKey, lightweight = false) {
-  const { start, end } = toUtcRange(period);
+function isPastPeriodBR(input) {
+  const parsed = parseBRDateOrRange(input);
+  if (!parsed) return true;
+  return parsed.startIso < todayInFortalezaISO();
+}
+
+function toUtcRangeFromFortalezaInput(input) {
+  const parsed = parseBRDateOrRange(input);
+  if (!parsed) throw new Error("Período inválido");
+
+  const startDate = new Date(`${parsed.startIso}T00:00:00-03:00`);
+  const endDate = new Date(`${parsed.endIso}T23:59:59-03:00`);
+
+  const formatForOddsApi = (date) =>
+    date.toISOString().replace(/\.\d{3}Z$/, "Z");
+
+  return {
+    label: parsed.label,
+    start: formatForOddsApi(startDate),
+    end: formatForOddsApi(endDate),
+  };
+}
+
+async function sendLongMessage(chatId, text) {
+  const chunkSize = 3500;
+  if (!text) return;
+
+  for (let i = 0; i < text.length; i += chunkSize) {
+    await bot.sendMessage(chatId, text.slice(i, i + chunkSize));
+  }
+}
+
+async function fetchJson(url, label = "REQUEST") {
+  const response = await fetch(url);
+  const rawText = await response.text();
+
+  if (!response.ok) {
+    throw new Error(`${label} ${response.status}: ${rawText}`);
+  }
+
+  try {
+    return JSON.parse(rawText);
+  } catch {
+    throw new Error(`${label}_JSON_INVALID: ${rawText}`);
+  }
+}
+
+async function buscarOddsPorPeriodoBR(periodInput, selectedSportKey, lightweight = false) {
+  const { start, end } = toUtcRangeFromFortalezaInput(periodInput);
 
   const params = new URLSearchParams({
     apiKey: oddsApiKey,
-    regions: "eu,uk",
-    markets: lightweight ? "h2h" : "h2h,totals,btts",
+    regions: lightweight ? "eu" : "eu,uk,us",
+    markets: lightweight ? "h2h" : "h2h,totals",
+    oddsFormat: "decimal",
     commenceTimeFrom: start,
     commenceTimeTo: end,
   });
 
-  const url = `https://api.the-odds-api.com/v4/sports/${sportKey}/odds?${params}`;
-  return fetchJson(url);
+  const url = `https://api.the-odds-api.com/v4/sports/${selectedSportKey}/odds?${params.toString()}`;
+
+  console.log("Buscando odds:", url.replace(oddsApiKey, "***"));
+
+  return fetchJson(url, "ODDS_API_ERROR");
 }
 
-async function buscarLigas() {
-  const url = `https://api.the-odds-api.com/v4/sports?apiKey=${oddsApiKey}`;
-  const sports = await fetchJson(url);
+async function buscarLigasSoccerAtivas() {
+  const params = new URLSearchParams({
+    apiKey: oddsApiKey,
+  });
 
-  return sports
-    .filter(s => s.key.startsWith("soccer_"))
-    .map(s => ({ key: s.key, label: s.title }));
+  const url = `https://api.the-odds-api.com/v4/sports?${params.toString()}`;
+  console.log("Buscando esportes ativos...");
+
+  const sports = await fetchJson(url, "SPORTS_API_ERROR");
+
+  return (sports || [])
+    .filter((item) => item?.key?.startsWith("soccer_"))
+    .filter((item) => !item?.key?.endsWith("_winner"))
+    .map((item) => ({
+      key: item.key,
+      label: item.title || item.key,
+    }));
 }
 
-// ================= LIGAS COM EVENTOS =================
-
-async function contarEventosLiga(period, liga) {
+async function contarEventosLiga(periodInput, league) {
   try {
-    const odds = await buscarOdds(period, liga.key, true);
+    const odds = await buscarOddsPorPeriodoBR(periodInput, league.key, true);
     return {
-      key: liga.key,
-      label: liga.label,
+      key: league.key,
+      label: league.label,
       count: Array.isArray(odds) ? odds.length : 0,
     };
-  } catch {
-    return { key: liga.key, label: liga.label, count: 0 };
+  } catch (error) {
+    console.error(`ERRO_CONTAGEM_LIGA_${league.key}:`, error.message);
+    return {
+      key: league.key,
+      label: league.label,
+      count: 0,
+    };
   }
 }
 
-async function buscarLigasComEventos(period) {
-  const ligas = await buscarLigas();
-  const resultados = [];
+async function buscarLigasComEventosNoPeriodo(periodInput) {
+  const activeLeagues = await buscarLigasSoccerAtivas();
+  const results = [];
+  const batchSize = 5;
 
-  for (let i = 0; i < ligas.length; i += 5) {
-    const batch = ligas.slice(i, i + 5);
+  for (let i = 0; i < activeLeagues.length; i += batchSize) {
+    const batch = activeLeagues.slice(i, i + batchSize);
 
-    const res = await Promise.all(
-      batch.map(l => contarEventosLiga(period, l))
+    const batchResults = await Promise.all(
+      batch.map((league) => contarEventosLiga(periodInput, league))
     );
 
-    resultados.push(...res);
+    results.push(...batchResults);
   }
 
-  return resultados
-    .filter(l => l.count > 0)
-    .sort((a, b) => b.count - a.count);
+  return results
+    .filter((item) => item.count > 0)
+    .sort((a, b) => {
+      if (b.count !== a.count) return b.count - a.count;
+      return a.label.localeCompare(b.label, "pt-BR");
+    });
 }
 
-function montarListaLigas(ligas) {
-  return ligas
-    .map((l, i) => `${i + 1}. ${l.label} (${l.count})`)
-    .join("\n");
+function buildLeagueMessages(leagueOptions) {
+  const lines = leagueOptions.map(
+    (item, index) => `${index + 1}. ${item.label} (${item.count}) — ${item.key}`
+  );
+
+  const chunks = [];
+  let current =
+    "⚽ Escolha um ou mais campeonatos.\nResponda com números separados por vírgula.\nExemplo: 1,3,5\n\n";
+
+  for (const line of lines) {
+    if ((current + line + "\n").length > 3500) {
+      chunks.push(current.trim());
+      current = "";
+    }
+    current += `${line}\n`;
+  }
+
+  if (current.trim()) {
+    chunks.push(current.trim());
+  }
+
+  return chunks;
 }
 
-// ================= SCORE INTELIGENTE =================
-
-function calcularScore(over, under, books, peso = 1) {
-  const prob = (1 / over) / ((1 / over) + (1 / under));
-
-  let score = 0;
-
-  if (prob > 0.55) score += 30;
-  if (over >= 1.4 && over <= 2.2) score += 30;
-  if (Math.abs(over - under) < 0.5) score += 20;
-  if (books >= 3) score += 20;
-
-  return Math.round(score * peso);
+async function sendLeagueList(chatId, leagueOptions) {
+  const messages = buildLeagueMessages(leagueOptions);
+  for (const msg of messages) {
+    await bot.sendMessage(chatId, msg);
+  }
 }
 
-function gerarScoreSeguro(jogo) {
-  let candidatos = [];
+function getLeagueChoices(input, leagueOptions) {
+  const text = input.trim();
 
-  for (const book of jogo.bookmakers || []) {
-    for (const market of book.markets || []) {
+  if (!text) return [];
 
-      // OVER 2.5
-      if (market.key === "totals") {
-        const over25 = market.outcomes?.find(o => o.name === "Over" && o.point === 2.5);
-        const under25 = market.outcomes?.find(o => o.name === "Under" && o.point === 2.5);
+  const parts = text
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
 
-        if (over25 && under25) {
-          candidatos.push({
-            tipo: "OVER 2.5",
-            odd: over25.price,
-            score: calcularScore(over25.price, under25.price, jogo.bookmakers.length, 1)
-          });
-        }
+  const selected = [];
+  const usedKeys = new Set();
 
-        // OVER 1.5
-        const over15 = market.outcomes?.find(o => o.name === "Over" && o.point === 1.5);
-        const under15 = market.outcomes?.find(o => o.name === "Under" && o.point === 1.5);
+  for (const part of parts) {
+    let found = null;
 
-        if (over15 && under15) {
-          candidatos.push({
-            tipo: "OVER 1.5",
-            odd: over15.price,
-            score: calcularScore(over15.price, under15.price, jogo.bookmakers.length, 0.8)
-          });
+    if (/^\d+$/.test(part)) {
+      const index = Number(part) - 1;
+      if (index >= 0 && index < leagueOptions.length) {
+        found = leagueOptions[index];
+      }
+    } else {
+      found =
+        leagueOptions.find(
+          (item) => item.key.toLowerCase() === part.toLowerCase()
+        ) || null;
+    }
+
+    if (found && !usedKeys.has(found.key)) {
+      usedKeys.add(found.key);
+      selected.push(found);
+    }
+  }
+
+  return selected;
+}
+
+function getBestH2H(bookmakers, homeTeam, awayTeam) {
+  const best = {
+    home: null,
+    draw: null,
+    away: null,
+  };
+
+  for (const bookmaker of bookmakers || []) {
+    const market = (bookmaker.markets || []).find((m) => m.key === "h2h");
+    if (!market) continue;
+
+    for (const outcome of market.outcomes || []) {
+      const item = {
+        bookmaker: bookmaker.title,
+        name: outcome.name,
+        price: Number(outcome.price),
+      };
+
+      if (outcome.name === homeTeam) {
+        if (!best.home || item.price > best.home.price) best.home = item;
+      } else if (outcome.name === awayTeam) {
+        if (!best.away || item.price > best.away.price) best.away = item;
+      } else if (
+        outcome.name?.toLowerCase() === "draw" ||
+        outcome.name?.toLowerCase() === "empate"
+      ) {
+        if (!best.draw || item.price > best.draw.price) best.draw = item;
+      }
+    }
+  }
+
+  return best;
+}
+
+function getBestTotalsByLine(bookmakers) {
+  const linesMap = new Map();
+
+  for (const bookmaker of bookmakers || []) {
+    const market = (bookmaker.markets || []).find((m) => m.key === "totals");
+    if (!market) continue;
+
+    for (const outcome of market.outcomes || []) {
+      const side = outcome.name?.toLowerCase();
+      const point = outcome.point;
+
+      if (
+        (side !== "over" && side !== "under") ||
+        point === undefined ||
+        point === null
+      ) {
+        continue;
+      }
+
+      const key = String(point);
+
+      if (!linesMap.has(key)) {
+        linesMap.set(key, {
+          point,
+          best_over: null,
+          best_under: null,
+        });
+      }
+
+      const line = linesMap.get(key);
+
+      const entry = {
+        bookmaker: bookmaker.title,
+        name: outcome.name,
+        price: Number(outcome.price),
+        point: outcome.point,
+      };
+
+      if (side === "over") {
+        if (!line.best_over || entry.price > line.best_over.price) {
+          line.best_over = entry;
         }
       }
 
-      // BTTS
-      if (market.key === "btts") {
-        const sim = market.outcomes?.find(o => o.name === "Yes");
-        const nao = market.outcomes?.find(o => o.name === "No");
-
-        if (sim && nao) {
-          candidatos.push({
-            tipo: "BTTS SIM",
-            odd: sim.price,
-            score: calcularScore(sim.price, nao.price, jogo.bookmakers.length, 0.7)
-          });
-        }
-      }
-
-      // fallback vitória
-      if (market.key === "h2h") {
-        const favorito = market.outcomes?.sort((a, b) => a.price - b.price)[0];
-
-        if (favorito) {
-          candidatos.push({
-            tipo: `VITÓRIA ${favorito.name}`,
-            odd: favorito.price,
-            score: 40
-          });
+      if (side === "under") {
+        if (!line.best_under || entry.price > line.best_under.price) {
+          line.best_under = entry;
         }
       }
     }
   }
 
-  if (candidatos.length === 0) return null;
+  const lines = Array.from(linesMap.values()).map((line) => {
+    const balanceScore =
+      line.best_over && line.best_under
+        ? Math.abs(line.best_over.price - line.best_under.price)
+        : 999;
 
-  return candidatos.sort((a, b) => b.score - a.score)[0];
+    const distanceFrom25 =
+      typeof line.point === "number" ? Math.abs(line.point - 2.5) : 999;
+
+    return {
+      point: line.point,
+      best_over: line.best_over,
+      best_under: line.best_under,
+      balanceScore,
+      distanceFrom25,
+    };
+  });
+
+  lines.sort((a, b) => {
+    if (a.balanceScore !== b.balanceScore) {
+      return a.balanceScore - b.balanceScore;
+    }
+    return a.distanceFrom25 - b.distanceFrom25;
+  });
+
+  return lines.slice(0, 3).map((line) => ({
+    point: line.point,
+    best_over: line.best_over,
+    best_under: line.best_under,
+  }));
 }
 
-function gerarTopSeguro(jogos) {
-  let analisados = jogos
-    .map(j => {
-      const s = gerarScoreSeguro(j);
-      if (!s) return null;
-      return { ...j, ...s };
-    })
-    .filter(Boolean)
-    .sort((a, b) => b.score - a.score);
+function resumirJogos(oddsData, leagueLabel, sportKey) {
+  return (oddsData || [])
+    .sort((a, b) => new Date(a.commence_time) - new Date(b.commence_time))
+    .map((game) => {
+      const bestH2H = getBestH2H(game.bookmakers, game.home_team, game.away_team);
+      const totalsLines = getBestTotalsByLine(game.bookmakers);
 
-  if (analisados.length === 0) {
-    return jogos.slice(0, 20).map(j => ({
-      ...j,
-      score: 50,
-      odd: 1.5,
-      tipo: "JOGO EQUILIBRADO"
-    }));
+      return {
+        jogo: `${game.home_team} x ${game.away_team}`,
+        horario: formatDateBR(game.commence_time),
+        home_team: game.home_team,
+        away_team: game.away_team,
+        bookmakers_count: (game.bookmakers || []).length,
+        league_label: leagueLabel,
+        sport_key: sportKey,
+        h2h: {
+          mandante: bestH2H.home,
+          empate: bestH2H.draw,
+          visitante: bestH2H.away,
+        },
+        totals_lines: totalsLines,
+      };
+    });
+}
+
+function calcularSurebetH2H(jogo) {
+  const home = jogo.h2h?.mandante;
+  const draw = jogo.h2h?.empate;
+  const away = jogo.h2h?.visitante;
+
+  if (!home || !draw || !away) return null;
+  if (!home.price || !draw.price || !away.price) return null;
+
+  const somaInversos =
+    1 / Number(home.price) +
+    1 / Number(draw.price) +
+    1 / Number(away.price);
+
+  if (somaInversos >= 1) return null;
+
+  const margem = (1 - somaInversos) * 100;
+
+  return {
+    jogo: jogo.jogo,
+    horario: jogo.horario,
+    league_label: jogo.league_label,
+    sport_key: jogo.sport_key,
+    somaInversos,
+    margem,
+    selecoes: {
+      mandante: home,
+      empate: draw,
+      visitante: away,
+    },
+  };
+}
+
+function calcularDistribuicaoStakes(oddHome, oddDraw, oddAway, totalStake = 100) {
+  const invHome = 1 / oddHome;
+  const invDraw = 1 / oddDraw;
+  const invAway = 1 / oddAway;
+  const soma = invHome + invDraw + invAway;
+
+  const stakeHome = (totalStake * invHome) / soma;
+  const stakeDraw = (totalStake * invDraw) / soma;
+  const stakeAway = (totalStake * invAway) / soma;
+
+  const retornoHome = stakeHome * oddHome;
+  const retornoDraw = stakeDraw * oddDraw;
+  const retornoAway = stakeAway * oddAway;
+
+  const retornoGarantido = Math.min(retornoHome, retornoDraw, retornoAway);
+  const lucroGarantido = retornoGarantido - totalStake;
+
+  return {
+    stakeHome,
+    stakeDraw,
+    stakeAway,
+    retornoGarantido,
+    lucroGarantido,
+  };
+}
+
+function formatMoneyBR(value) {
+  return Number(value).toLocaleString("pt-BR", {
+    style: "currency",
+    currency: "BRL",
+  });
+}
+
+function formatPercent(value) {
+  return `${Number(value).toFixed(2)}%`;
+}
+
+function montarTextoSurebets(surebets, periodLabel, selectedLeagues) {
+  const ligasTexto = selectedLeagues
+    .map((item) => `${item.label} (${item.key})`)
+    .join(", ");
+
+  if (!surebets.length) {
+    return [
+      `📅 Período analisado: ${periodLabel}`,
+      `🏆 Ligas: ${ligasTexto}`,
+      "",
+      "Nenhuma surebet H2H encontrada neste período.",
+      "",
+      "Isso significa que, com os jogos e odds disponíveis, não houve combinação de mandante/empate/visitante com soma dos inversos menor que 1.",
+    ].join("\n");
   }
 
-  return analisados.slice(0, 50);
+  let texto = [
+    `📅 Período analisado: ${periodLabel}`,
+    `🏆 Ligas: ${ligasTexto}`,
+    `✅ Surebets encontradas: ${surebets.length}`,
+    "",
+  ].join("\n");
+
+  surebets.forEach((item, index) => {
+    const home = item.selecoes.mandante;
+    const draw = item.selecoes.empate;
+    const away = item.selecoes.visitante;
+
+    const stakes = calcularDistribuicaoStakes(
+      home.price,
+      draw.price,
+      away.price,
+      100
+    );
+
+    texto += [
+      `#${index + 1} ${item.jogo}`,
+      `Liga: ${item.league_label} (${item.sport_key})`,
+      `Horário: ${item.horario}`,
+      `Margem de arbitragem: ${formatPercent(item.margem)}`,
+      "",
+      `Mandante: ${home.name} @ ${home.price} | Casa: ${home.bookmaker}`,
+      `Empate: ${draw.name} @ ${draw.price} | Casa: ${draw.bookmaker}`,
+      `Visitante: ${away.name} @ ${away.price} | Casa: ${away.bookmaker}`,
+      "",
+      `Exemplo de divisão para ${formatMoneyBR(100)} total:`,
+      `- Mandante: ${formatMoneyBR(stakes.stakeHome)}`,
+      `- Empate: ${formatMoneyBR(stakes.stakeDraw)}`,
+      `- Visitante: ${formatMoneyBR(stakes.stakeAway)}`,
+      `Retorno garantido estimado: ${formatMoneyBR(stakes.retornoGarantido)}`,
+      `Lucro garantido estimado: ${formatMoneyBR(stakes.lucroGarantido)}`,
+      "",
+      "Observação: confirme a odd no momento da execução, pois a arbitragem pode desaparecer rapidamente.",
+      "",
+      "----------------------------------------",
+      "",
+    ].join("\n");
+  });
+
+  return texto.trim();
 }
 
-// ================= BOT =================
+bot.onText(/\/start/, async (msg) => {
+  await bot.sendMessage(
+    msg.chat.id,
+    [
+      "🤖 Tipster365 ativo.",
+      "",
+      "Comandos disponíveis:",
+      "/analise - escolher data ou período, depois uma ou mais ligas",
+      "/surebet - escolher data ou período, depois uma ou mais ligas",
+      "/cancelar - cancelar solicitação atual",
+      "",
+      "Formatos aceitos:",
+      "22/03/2026",
+      "22/03/2026 a 25/03/2026",
+      "",
+      "Para ligas múltiplas, responda por exemplo:",
+      "1,3,5",
+    ].join("\n")
+  );
+});
 
-bot.onText(/\/analise/, msg => {
-  pendingRequests.set(msg.chat.id, { step: "data" });
-  bot.sendMessage(msg.chat.id, "Digite a data (ex: 05/04/2026)");
+bot.onText(/\/cancelar/, async (msg) => {
+  pendingRequests.delete(msg.chat.id);
+  await bot.sendMessage(msg.chat.id, "✅ Solicitação cancelada.");
+});
+
+bot.onText(/\/analise/, async (msg) => {
+  pendingRequests.set(msg.chat.id, { type: "analise", step: "period" });
+  await bot.sendMessage(
+    msg.chat.id,
+    "📅 Me envie uma data ou período no formato:\n22/03/2026\nou\n22/03/2026 a 25/03/2026"
+  );
+});
+
+bot.onText(/\/surebet/, async (msg) => {
+  pendingRequests.set(msg.chat.id, { type: "surebet", step: "period" });
+  await bot.sendMessage(
+    msg.chat.id,
+    "📅 Me envie uma data ou período no formato:\n22/03/2026\nou\n22/03/2026 a 25/03/2026"
+  );
 });
 
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
-  const text = msg.text;
+  const text = (msg.text || "").trim();
   const pending = pendingRequests.get(chatId);
 
   if (!pending) return;
+  if (text.startsWith("/")) return;
 
-  // DATA
-  if (pending.step === "data") {
-    const ligas = await buscarLigasComEventos(text);
+  if (pending.step === "period") {
+    const parsed = parseBRDateOrRange(text);
 
-    pendingRequests.set(chatId, {
-      step: "ligas",
-      period: text,
-      ligas
-    });
+    if (!parsed) {
+      await bot.sendMessage(
+        chatId,
+        "❌ Formato inválido.\nUse:\n22/03/2026\nou\n22/03/2026 a 25/03/2026"
+      );
+      return;
+    }
 
-    bot.sendMessage(chatId, "Escolha as ligas:\n\n" + montarListaLigas(ligas));
+    if (isPastPeriodBR(text)) {
+      await bot.sendMessage(
+        chatId,
+        "❌ O período informado começa no passado. Nesta versão simples, eu analiso apenas hoje ou datas futuras."
+      );
+      return;
+    }
+
+    await bot.sendMessage(
+      chatId,
+      `⏳ Levantando ligas com jogos em ${parsed.label}...`
+    );
+
+    try {
+      const leagueOptions = await buscarLigasComEventosNoPeriodo(text);
+
+      if (!leagueOptions.length) {
+        pendingRequests.delete(chatId);
+        await bot.sendMessage(
+          chatId,
+          `Nenhuma liga de futebol com jogos foi encontrada para ${parsed.label}.`
+        );
+        return;
+      }
+
+      pendingRequests.set(chatId, {
+        type: pending.type,
+        step: "league",
+        periodInput: text,
+        leagueOptions,
+      });
+
+      await bot.sendMessage(
+        chatId,
+        `✅ Encontrei ${leagueOptions.length} liga(s) com jogos em ${parsed.label}.`
+      );
+      await sendLeagueList(chatId, leagueOptions);
+    } catch (error) {
+      pendingRequests.delete(chatId);
+      console.error("ERRO_LISTA_LIGAS:", error);
+      await bot.sendMessage(
+        chatId,
+        "❌ Erro ao levantar as ligas do período informado. Veja os logs do Railway para o detalhe."
+      );
+    }
+
     return;
   }
 
-  // LIGAS
-  if (pending.step === "ligas") {
-    const escolhas = text.split(",").map(x => Number(x.trim()) - 1);
-    const selecionadas = escolhas.map(i => pending.ligas[i]).filter(Boolean);
+  if (pending.step === "league") {
+    const chosenLeagues = getLeagueChoices(text, pending.leagueOptions || []);
 
-    let jogos = [];
-
-    for (const liga of selecionadas) {
-      const odds = await buscarOdds(pending.period, liga.key);
-
-      odds.forEach(j => {
-        jogos.push({
-          ...j,
-          liga: liga.label,
-          jogo: `${j.home_team} x ${j.away_team}`,
-          horario: formatDateBR(j.commence_time)
-        });
-      });
+    if (!chosenLeagues.length) {
+      await bot.sendMessage(
+        chatId,
+        "❌ Campeonato inválido. Responda com um ou mais números da lista. Exemplo: 1,3,5"
+      );
+      return;
     }
 
-    console.log("TOTAL JOGOS:", jogos.length);
-
-    const top = gerarTopSeguro(jogos);
-
-    let resposta = "🔥 TOP 50 DO DIA\n\n";
-
-    top.forEach((j, i) => {
-      resposta += `${i + 1}. ${j.jogo}\n🏆 ${j.liga}\n⏰ ${j.horario}\n📊 ${j.score}%\n🎯 ${j.tipo}\n💰 ${j.odd}\n\n`;
-    });
-
-    bot.sendMessage(chatId, resposta);
-
     pendingRequests.delete(chatId);
+
+    const selectedPeriodInput = pending.periodInput;
+    const periodData = parseBRDateOrRange(selectedPeriodInput);
+    const periodLabel = periodData?.label || selectedPeriodInput;
+
+    let jogos = [];
+    let totalEventosEncontrados = 0;
+
+    try {
+      await bot.sendMessage(
+        chatId,
+        `⏳ Buscando jogos reais para ${periodLabel} nas ligas selecionadas...`
+      );
+
+      for (const league of chosenLeagues) {
+        const odds = await buscarOddsPorPeriodoBR(selectedPeriodInput, league.key, false);
+        const jogosDaLiga = resumirJogos(odds, league.label, league.key);
+
+        totalEventosEncontrados += Array.isArray(odds) ? odds.length : 0;
+        jogos.push(...jogosDaLiga);
+      }
+
+      const eventosAnalisados = Math.min(jogos.length, MAX_EVENTS_FOR_AI);
+
+      await bot.sendMessage(
+        chatId,
+        `📋 Encontrei ${totalEventosEncontrados} evento(s) no período.`
+      );
+
+      if (!jogos.length) {
+        await bot.sendMessage(
+          chatId,
+          `Nenhum jogo encontrado para ${periodLabel} nas ligas selecionadas.`
+        );
+        return;
+      }
+
+      jogos = jogos.slice(0, MAX_EVENTS_FOR_AI);
+
+      await bot.sendMessage(
+        chatId,
+        `🧠 Vou analisar ${eventosAnalisados} evento(s) para montar o resultado.`
+      );
+    } catch (error) {
+      console.error("ERRO_ODDS:", error);
+      await bot.sendMessage(
+        chatId,
+        "❌ Erro ao buscar os jogos do período informado. Veja os logs do Railway para o detalhe."
+      );
+      return;
+    }
+
+    if (pending.type === "surebet") {
+      try {
+        await bot.sendMessage(chatId, "🔎 Calculando surebets H2H...");
+
+        const surebets = jogos
+          .map(calcularSurebetH2H)
+          .filter(Boolean)
+          .sort((a, b) => b.margem - a.margem);
+
+        const textoSurebets = montarTextoSurebets(
+          surebets,
+          periodLabel,
+          chosenLeagues
+        );
+
+        await sendLongMessage(chatId, textoSurebets);
+      } catch (error) {
+        console.error("ERRO_SUREBET:", error);
+        await bot.sendMessage(
+          chatId,
+          "❌ Erro ao calcular surebets. Veja os logs do Railway para o detalhe."
+        );
+      }
+
+      return;
+    }
+
+    if (pending.type === "analise") {
+      try {
+        await bot.sendMessage(chatId, "🤖 Gerando análise com IA...");
+
+        const eventosAnalisados = jogos.length;
+        const ligasTexto = chosenLeagues
+          .map((item) => `${item.label} (${item.key})`)
+          .join(", ");
+
+        const prompt = `
+Você é um analista profissional de apostas esportivas.
+
+Analise SOMENTE os dados reais fornecidos abaixo.
+Considere apenas os mercados H2H e OVER/UNDER gols.
+Não invente jogos, odds, linhas, horários, estatísticas externas ou contexto não fornecido.
+Se os dados forem insuficientes, diga isso claramente.
+
+Objetivo:
+Selecionar as melhores dicas de apostas do período solicitado com base em:
+- solidez do mercado
+- coerência entre linha e odd
+- favoritismo mais claro no H2H
+- linhas de gols mais consistentes no Over/Under
+- evitar entradas especulativas ou forçadas
+
+Regras obrigatórias:
+- Retorne no máximo 30 dicas.
+- Não force 30 dicas se o cenário não justificar.
+- Pode retornar menos, se forem as únicas realmente viáveis.
+- Evite repetir o mesmo jogo excessivamente.
+- Use no máximo 2 entradas por jogo.
+- Em OVER/UNDER, cite a linha explicitamente. Exemplo: Over 2.5 ou Under 2.5.
+- Ordene da melhor para a menos forte.
+- Não use justificativas genéricas como "odd interessante" ou "bom valor" sem explicar o motivo com base nos dados fornecidos.
+- Seja objetivo e específico.
+- Informe exatamente quantos eventos foram analisados para chegar ao resultado.
+
+Retorne exatamente neste formato:
+
+1. Período analisado
+2. Ligas analisadas
+3. Eventos encontrados no período
+4. Eventos analisados
+5. Resumo curto do cenário do período
+6. Top dicas do período
+
+Para cada dica, use exatamente:
+- Ranking:
+- Liga:
+- Jogo:
+- Horário:
+- Mercado:
+- Entrada:
+- Odd:
+- Casa:
+- Justificativa curta:
+
+7. Observação final de risco
+
+Período analisado: ${periodLabel}
+Ligas analisadas: ${ligasTexto}
+Eventos encontrados no período: ${totalEventosEncontrados}
+Eventos analisados: ${eventosAnalisados}
+
+Dados reais:
+${JSON.stringify(jogos, null, 2)}
+`;
+
+        const response = await client.responses.create({
+          model: "gpt-5.4",
+          input: prompt,
+        });
+
+        const textoResposta =
+          response.output_text || "Não foi possível gerar a análise.";
+
+        await sendLongMessage(chatId, textoResposta);
+      } catch (error) {
+        console.error("ERRO_OPENAI:", error);
+        await bot.sendMessage(
+          chatId,
+          "❌ Erro ao gerar a análise pela IA. Veja os logs do Railway para o detalhe."
+        );
+      }
+    }
   }
 });
 
-console.log("🔥 BOT 100% OPERACIONAL");
+console.log("Bot iniciado com seleção de período + múltiplas ligas + análise consolidada.");
