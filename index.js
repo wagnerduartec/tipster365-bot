@@ -829,7 +829,11 @@ Regras obrigatórias:
 - Use no máximo 2 entradas por jogo.
 - Em OVER/UNDER, cite a linha explicitamente. Exemplo: Over 2.5 ou Under 2.5.
 - Ordene da melhor para a menos forte.
-- Não use justificativas genéricas como "odd interessante" ou "bom valor" sem explicar o motivo com base nos dados fornecidos.
+- Não inclua justificativa curta em cada evento.
+- Em vez disso, informe probabilidade de acerto em percentual e nível de confiança como Alta, Média ou Baixa.
+- A probabilidade de acerto deve ser realista, conservadora e coerente com as odds e com a consistência do mercado apresentado.
+- Não infle percentuais só para parecer mais convincente.
+- Evite probabilidades extremas sem base clara nos dados.
 - Seja objetivo e específico.
 - Informe exatamente quantos eventos foram analisados para chegar ao resultado.
 
@@ -851,7 +855,8 @@ Para cada dica, use exatamente:
 - Entrada:
 - Odd:
 - Casa:
-- Justificativa curta:
+- Probabilidade de acerto:
+- Nível de confiança:
 
 7. Observação final de risco
 
