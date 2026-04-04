@@ -1,852 +1,217 @@
 import TelegramBot from "node-telegram-bot-api";
-import OpenAI from "openai";
 
 const telegramToken = process.env.TELEGRAM_TOKEN;
-const openaiKey = process.env.OPENAI_API_KEY;
 const oddsApiKey = process.env.ODDS_API_KEY;
 
 if (!telegramToken) throw new Error("Falta TELEGRAM_TOKEN");
-if (!openaiKey) throw new Error("Falta OPENAI_API_KEY");
 if (!oddsApiKey) throw new Error("Falta ODDS_API_KEY");
 
 const bot = new TelegramBot(telegramToken, { polling: true });
-const client = new OpenAI({ apiKey: openaiKey });
 
-const MAX_EVENTS_FOR_AI = 80;
-
-const pendingRequests = new Map();
-// chatId -> {
-//   type: "analise" | "surebet",
-//   step: "period" | "league",
-//   periodInput?: string,
-//   leagueOptions?: [{ key, label, count }]
-// }
+// =========================
+// UTIL
+// =========================
 
 function formatDateBR(isoDate) {
-  try {
-    return new Date(isoDate).toLocaleString("pt-BR", {
-      timeZone: "America/Fortaleza",
-      day: "2-digit",
-      month: "2-digit",
-      year: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-  } catch {
-    return isoDate;
-  }
-}
-
-function todayInFortalezaISO() {
-  const now = new Date();
-
-  const year = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "America/Fortaleza",
-    year: "numeric",
-  }).format(now);
-
-  const month = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "America/Fortaleza",
-    month: "2-digit",
-  }).format(now);
-
-  const day = new Intl.DateTimeFormat("en-CA", {
+  return new Date(isoDate).toLocaleString("pt-BR", {
     timeZone: "America/Fortaleza",
     day: "2-digit",
-  }).format(now);
-
-  return `${year}-${month}-${day}`;
+    month: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
-function parseBRDate(dateStr) {
-  if (!/^\d{2}\/\d{2}\/\d{4}$/.test(dateStr)) return null;
+async function fetchJson(url) {
+  const res = await fetch(url);
+  return res.json();
+}
 
-  const [dayStr, monthStr, yearStr] = dateStr.split("/");
-  const day = Number(dayStr);
-  const month = Number(monthStr);
-  const year = Number(yearStr);
+// =========================
+// BUSCAR DADOS
+// =========================
 
-  if (!day || !month || !year) return null;
-  if (month < 1 || month > 12) return null;
-  if (day < 1 || day > 31) return null;
+async function buscarLigas() {
+  const url = `https://api.the-odds-api.com/v4/sports?apiKey=${oddsApiKey}`;
+  const data = await fetchJson(url);
 
-  const testDate = new Date(Date.UTC(year, month - 1, day));
-  const valid =
-    testDate.getUTCFullYear() === year &&
-    testDate.getUTCMonth() === month - 1 &&
-    testDate.getUTCDate() === day;
+  return data
+    .filter(s => s.key.startsWith("soccer_"))
+    .filter(s => !s.key.endsWith("_winner"));
+}
 
-  if (!valid) return null;
+async function buscarJogosLiga(ligaKey) {
+  const url = `https://api.the-odds-api.com/v4/sports/${ligaKey}/odds/?apiKey=${oddsApiKey}&regions=eu&markets=h2h,totals`;
 
-  const isoDate = `${yearStr}-${monthStr}-${dayStr}`;
+  try {
+    return await fetchJson(url);
+  } catch {
+    return [];
+  }
+}
+
+// =========================
+// PROCESSAMENTO
+// =========================
+
+function resumirJogo(game) {
+  if (!game.bookmakers?.length) return null;
+
+  const totals = game.bookmakers[0].markets.find(m => m.key === "totals");
+  if (!totals) return null;
+
+  const linha25 = totals.outcomes.filter(o => o.point === 2.5);
+  if (linha25.length < 2) return null;
+
+  const over = linha25.find(o => o.name === "Over");
+  const under = linha25.find(o => o.name === "Under");
+
+  if (!over || !under) return null;
 
   return {
-    original: dateStr,
-    dayStr,
-    monthStr,
-    yearStr,
-    isoDate,
+    jogo: `${game.home_team} x ${game.away_team}`,
+    horario: formatDateBR(game.commence_time),
+    data: new Date(game.commence_time),
+    oddOver: over.price,
+    oddUnder: under.price,
+    casa: game.bookmakers[0].title,
+    casas: game.bookmakers.length
   };
 }
 
-function parseBRDateOrRange(input) {
-  const cleaned = input.trim().replace(/\s+/g, " ");
-  const parts = cleaned.split(/\s+a\s+/i);
+// =========================
+// FILTROS
+// =========================
 
-  if (parts.length === 1) {
-    const single = parseBRDate(parts[0]);
-    if (!single) return null;
-
-    return {
-      kind: "single",
-      label: parts[0],
-      startDateBr: parts[0],
-      endDateBr: parts[0],
-      startIso: single.isoDate,
-      endIso: single.isoDate,
-    };
-  }
-
-  if (parts.length === 2) {
-    const start = parseBRDate(parts[0]);
-    const end = parseBRDate(parts[1]);
-
-    if (!start || !end) return null;
-    if (start.isoDate > end.isoDate) return null;
-
-    return {
-      kind: "range",
-      label: `${parts[0]} a ${parts[1]}`,
-      startDateBr: parts[0],
-      endDateBr: parts[1],
-      startIso: start.isoDate,
-      endIso: end.isoDate,
-    };
-  }
-
-  return null;
+function apenasPreJogo(jogos) {
+  const agora = new Date();
+  return jogos.filter(j => j.data > agora);
 }
 
-function isPastPeriodBR(input) {
-  const parsed = parseBRDateOrRange(input);
-  if (!parsed) return true;
-  return parsed.startIso < todayInFortalezaISO();
+function filtroQualidade(jogo) {
+  return jogo.casas >= 5 && jogo.oddOver && jogo.oddUnder;
 }
 
-function toUtcRangeFromFortalezaInput(input) {
-  const parsed = parseBRDateOrRange(input);
-  if (!parsed) throw new Error("Período inválido");
+// =========================
+// SCORE PROFISSIONAL
+// =========================
 
-  const startDate = new Date(`${parsed.startIso}T00:00:00-03:00`);
-  const endDate = new Date(`${parsed.endIso}T23:59:59-03:00`);
+function calcularScore(jogo) {
+  let score = 0;
 
-  const formatForOddsApi = (date) =>
-    date.toISOString().replace(/\.\d{3}Z$/, "Z");
+  const prob = (1 / jogo.oddOver) / ((1 / jogo.oddOver) + (1 / jogo.oddUnder));
+
+  if (prob > 0.60) score += 25;
+  if (prob > 0.65) score += 15;
+  if (prob > 0.70) score += 10;
+
+  if (jogo.oddOver >= 1.55 && jogo.oddOver <= 1.80) score += 25;
+
+  const diff = Math.abs(jogo.oddOver - jogo.oddUnder);
+  if (diff < 0.30) score += 20;
+
+  if (jogo.casas >= 10) score += 20;
+
+  return Math.min(score, 95);
+}
+
+// =========================
+// SCAN GLOBAL
+// =========================
+
+async function scanGlobal() {
+  const ligas = await buscarLigas();
+
+  let todos = [];
+
+  for (const liga of ligas) {
+    const jogos = await buscarJogosLiga(liga.key);
+
+    const processados = jogos
+      .map(resumirJogo)
+      .filter(Boolean)
+      .map(j => ({ ...j, liga: liga.title }));
+
+    todos.push(...processados);
+  }
+
+  const pre = apenasPreJogo(todos);
+
+  const analisados = pre
+    .filter(filtroQualidade)
+    .map(j => ({
+      ...j,
+      score: calcularScore(j)
+    }))
+    .filter(j => j.score >= 70)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 50);
 
   return {
-    label: parsed.label,
-    start: formatForOddsApi(startDate),
-    end: formatForOddsApi(endDate),
+    total: todos.length,
+    selecionados: analisados
   };
+}
+
+// =========================
+// FORMATAR
+// =========================
+
+function formatarMensagem(resultado) {
+  let texto = `🔥 TOP 50 PRÉ-JOGOS DO DIA\n\n`;
+  texto += `📊 Jogos analisados: ${resultado.total}\n\n`;
+
+  resultado.selecionados.forEach((j, i) => {
+    texto += [
+      `${i + 1}. ${j.jogo}`,
+      `🏆 ${j.liga}`,
+      `⏰ ${j.horario}`,
+      `📊 ${j.score}%`,
+      `🎯 Over 2.5`,
+      `💰 ${j.oddOver}`,
+      "",
+    ].join("\n");
+  });
+
+  return texto;
 }
 
 async function sendLongMessage(chatId, text) {
-  const chunkSize = 3500;
-  if (!text) return;
-
-  for (let i = 0; i < text.length; i += chunkSize) {
-    await bot.sendMessage(chatId, text.slice(i, i + chunkSize));
+  const chunk = 4000;
+  for (let i = 0; i < text.length; i += chunk) {
+    await bot.sendMessage(chatId, text.slice(i, i + chunk));
   }
 }
 
-async function fetchJson(url, label = "REQUEST") {
-  const response = await fetch(url);
-  const rawText = await response.text();
-
-  if (!response.ok) {
-    throw new Error(`${label} ${response.status}: ${rawText}`);
-  }
-
-  try {
-    return JSON.parse(rawText);
-  } catch {
-    throw new Error(`${label}_JSON_INVALID: ${rawText}`);
-  }
-}
-
-async function buscarOddsPorPeriodoBR(periodInput, selectedSportKey, lightweight = false) {
-  const { start, end } = toUtcRangeFromFortalezaInput(periodInput);
-
-  const params = new URLSearchParams({
-    apiKey: oddsApiKey,
-    regions: lightweight ? "eu" : "eu,uk,us",
-    markets: lightweight ? "h2h" : "h2h,totals",
-    oddsFormat: "decimal",
-    commenceTimeFrom: start,
-    commenceTimeTo: end,
-  });
-
-  const url = `https://api.the-odds-api.com/v4/sports/${selectedSportKey}/odds?${params.toString()}`;
-
-  console.log("Buscando odds:", url.replace(oddsApiKey, "***"));
-
-  return fetchJson(url, "ODDS_API_ERROR");
-}
-
-async function buscarLigasSoccerAtivas() {
-  const params = new URLSearchParams({
-    apiKey: oddsApiKey,
-  });
-
-  const url = `https://api.the-odds-api.com/v4/sports?${params.toString()}`;
-  console.log("Buscando esportes ativos...");
-
-  const sports = await fetchJson(url, "SPORTS_API_ERROR");
-
-  return (sports || [])
-    .filter((item) => item?.key?.startsWith("soccer_"))
-    .filter((item) => !item?.key?.endsWith("_winner"))
-    .map((item) => ({
-      key: item.key,
-      label: item.title || item.key,
-    }));
-}
-
-async function contarEventosLiga(periodInput, league) {
-  try {
-    const odds = await buscarOddsPorPeriodoBR(periodInput, league.key, true);
-    return {
-      key: league.key,
-      label: league.label,
-      count: Array.isArray(odds) ? odds.length : 0,
-    };
-  } catch (error) {
-    console.error(`ERRO_CONTAGEM_LIGA_${league.key}:`, error.message);
-    return {
-      key: league.key,
-      label: league.label,
-      count: 0,
-    };
-  }
-}
-
-async function buscarLigasComEventosNoPeriodo(periodInput) {
-  const activeLeagues = await buscarLigasSoccerAtivas();
-  const results = [];
-  const batchSize = 5;
-
-  for (let i = 0; i < activeLeagues.length; i += batchSize) {
-    const batch = activeLeagues.slice(i, i + batchSize);
-
-    const batchResults = await Promise.all(
-      batch.map((league) => contarEventosLiga(periodInput, league))
-    );
-
-    results.push(...batchResults);
-  }
-
-  return results
-    .filter((item) => item.count > 0)
-    .sort((a, b) => {
-      if (b.count !== a.count) return b.count - a.count;
-      return a.label.localeCompare(b.label, "pt-BR");
-    });
-}
-
-function buildLeagueMessages(leagueOptions) {
-  const lines = leagueOptions.map(
-    (item, index) => `${index + 1}. ${item.label} (${item.count}) — ${item.key}`
-  );
-
-  const chunks = [];
-  let current =
-    "⚽ Escolha o campeonato.\nResponda com o número da liga desejada.\n\n";
-
-  for (const line of lines) {
-    if ((current + line + "\n").length > 3500) {
-      chunks.push(current.trim());
-      current = "";
-    }
-    current += `${line}\n`;
-  }
-
-  if (current.trim()) {
-    chunks.push(current.trim());
-  }
-
-  return chunks;
-}
-
-async function sendLeagueList(chatId, leagueOptions) {
-  const messages = buildLeagueMessages(leagueOptions);
-  for (const msg of messages) {
-    await bot.sendMessage(chatId, msg);
-  }
-}
-
-function getLeagueChoice(input, leagueOptions) {
-  const text = input.trim();
-
-  if (/^\d+$/.test(text)) {
-    const index = Number(text) - 1;
-    if (index >= 0 && index < leagueOptions.length) {
-      return leagueOptions[index];
-    }
-  }
-
-  const direct = leagueOptions.find(
-    (item) => item.key.toLowerCase() === text.toLowerCase()
-  );
-
-  return direct || null;
-}
-
-function getBestH2H(bookmakers, homeTeam, awayTeam) {
-  const best = {
-    home: null,
-    draw: null,
-    away: null,
-  };
-
-  for (const bookmaker of bookmakers || []) {
-    const market = (bookmaker.markets || []).find((m) => m.key === "h2h");
-    if (!market) continue;
-
-    for (const outcome of market.outcomes || []) {
-      const item = {
-        bookmaker: bookmaker.title,
-        name: outcome.name,
-        price: Number(outcome.price),
-      };
-
-      if (outcome.name === homeTeam) {
-        if (!best.home || item.price > best.home.price) best.home = item;
-      } else if (outcome.name === awayTeam) {
-        if (!best.away || item.price > best.away.price) best.away = item;
-      } else if (
-        outcome.name?.toLowerCase() === "draw" ||
-        outcome.name?.toLowerCase() === "empate"
-      ) {
-        if (!best.draw || item.price > best.draw.price) best.draw = item;
-      }
-    }
-  }
-
-  return best;
-}
-
-function getBestTotalsByLine(bookmakers) {
-  const linesMap = new Map();
-
-  for (const bookmaker of bookmakers || []) {
-    const market = (bookmaker.markets || []).find((m) => m.key === "totals");
-    if (!market) continue;
-
-    for (const outcome of market.outcomes || []) {
-      const side = outcome.name?.toLowerCase();
-      const point = outcome.point;
-
-      if (
-        (side !== "over" && side !== "under") ||
-        point === undefined ||
-        point === null
-      ) {
-        continue;
-      }
-
-      const key = String(point);
-
-      if (!linesMap.has(key)) {
-        linesMap.set(key, {
-          point,
-          best_over: null,
-          best_under: null,
-        });
-      }
-
-      const line = linesMap.get(key);
-
-      const entry = {
-        bookmaker: bookmaker.title,
-        name: outcome.name,
-        price: Number(outcome.price),
-        point: outcome.point,
-      };
-
-      if (side === "over") {
-        if (!line.best_over || entry.price > line.best_over.price) {
-          line.best_over = entry;
-        }
-      }
-
-      if (side === "under") {
-        if (!line.best_under || entry.price > line.best_under.price) {
-          line.best_under = entry;
-        }
-      }
-    }
-  }
-
-  const lines = Array.from(linesMap.values()).map((line) => {
-    const balanceScore =
-      line.best_over && line.best_under
-        ? Math.abs(line.best_over.price - line.best_under.price)
-        : 999;
-
-    const distanceFrom25 =
-      typeof line.point === "number" ? Math.abs(line.point - 2.5) : 999;
-
-    return {
-      point: line.point,
-      best_over: line.best_over,
-      best_under: line.best_under,
-      balanceScore,
-      distanceFrom25,
-    };
-  });
-
-  lines.sort((a, b) => {
-    if (a.balanceScore !== b.balanceScore) {
-      return a.balanceScore - b.balanceScore;
-    }
-    return a.distanceFrom25 - b.distanceFrom25;
-  });
-
-  return lines.slice(0, 3).map((line) => ({
-    point: line.point,
-    best_over: line.best_over,
-    best_under: line.best_under,
-  }));
-}
-
-function resumirJogos(oddsData) {
-  return (oddsData || [])
-    .sort((a, b) => new Date(a.commence_time) - new Date(b.commence_time))
-    .map((game) => {
-      const bestH2H = getBestH2H(game.bookmakers, game.home_team, game.away_team);
-      const totalsLines = getBestTotalsByLine(game.bookmakers);
-
-      return {
-        jogo: `${game.home_team} x ${game.away_team}`,
-        horario: formatDateBR(game.commence_time),
-        home_team: game.home_team,
-        away_team: game.away_team,
-        bookmakers_count: (game.bookmakers || []).length,
-        h2h: {
-          mandante: bestH2H.home,
-          empate: bestH2H.draw,
-          visitante: bestH2H.away,
-        },
-        totals_lines: totalsLines,
-      };
-    });
-}
-
-function calcularSurebetH2H(jogo) {
-  const home = jogo.h2h?.mandante;
-  const draw = jogo.h2h?.empate;
-  const away = jogo.h2h?.visitante;
-
-  if (!home || !draw || !away) return null;
-  if (!home.price || !draw.price || !away.price) return null;
-
-  const somaInversos =
-    1 / Number(home.price) +
-    1 / Number(draw.price) +
-    1 / Number(away.price);
-
-  if (somaInversos >= 1) return null;
-
-  const margem = (1 - somaInversos) * 100;
-
-  return {
-    jogo: jogo.jogo,
-    horario: jogo.horario,
-    somaInversos,
-    margem,
-    selecoes: {
-      mandante: home,
-      empate: draw,
-      visitante: away,
-    },
-  };
-}
-
-function calcularDistribuicaoStakes(oddHome, oddDraw, oddAway, totalStake = 100) {
-  const invHome = 1 / oddHome;
-  const invDraw = 1 / oddDraw;
-  const invAway = 1 / oddAway;
-  const soma = invHome + invDraw + invAway;
-
-  const stakeHome = (totalStake * invHome) / soma;
-  const stakeDraw = (totalStake * invDraw) / soma;
-  const stakeAway = (totalStake * invAway) / soma;
-
-  const retornoHome = stakeHome * oddHome;
-  const retornoDraw = stakeDraw * oddDraw;
-  const retornoAway = stakeAway * oddAway;
-
-  const retornoGarantido = Math.min(retornoHome, retornoDraw, retornoAway);
-  const lucroGarantido = retornoGarantido - totalStake;
-
-  return {
-    stakeHome,
-    stakeDraw,
-    stakeAway,
-    retornoGarantido,
-    lucroGarantido,
-  };
-}
-
-function formatMoneyBR(value) {
-  return Number(value).toLocaleString("pt-BR", {
-    style: "currency",
-    currency: "BRL",
-  });
-}
-
-function formatPercent(value) {
-  return `${Number(value).toFixed(2)}%`;
-}
-
-function montarTextoSurebets(surebets, periodLabel, selectedSportKey, selectedLeagueLabel) {
-  if (!surebets.length) {
-    return [
-      `📅 Período analisado: ${periodLabel}`,
-      `🏆 Liga: ${selectedLeagueLabel} (${selectedSportKey})`,
-      "",
-      "Nenhuma surebet H2H encontrada neste período.",
-      "",
-      "Isso significa que, com os jogos e odds disponíveis, não houve combinação de mandante/empate/visitante com soma dos inversos menor que 1.",
-    ].join("\n");
-  }
-
-  let texto = [
-    `📅 Período analisado: ${periodLabel}`,
-    `🏆 Liga: ${selectedLeagueLabel} (${selectedSportKey})`,
-    `✅ Surebets encontradas: ${surebets.length}`,
-    "",
-  ].join("\n");
-
-  surebets.forEach((item, index) => {
-    const home = item.selecoes.mandante;
-    const draw = item.selecoes.empate;
-    const away = item.selecoes.visitante;
-
-    const stakes = calcularDistribuicaoStakes(
-      home.price,
-      draw.price,
-      away.price,
-      100
-    );
-
-    texto += [
-      `#${index + 1} ${item.jogo}`,
-      `Horário: ${item.horario}`,
-      `Margem de arbitragem: ${formatPercent(item.margem)}`,
-      "",
-      `Mandante: ${home.name} @ ${home.price} | Casa: ${home.bookmaker}`,
-      `Empate: ${draw.name} @ ${draw.price} | Casa: ${draw.bookmaker}`,
-      `Visitante: ${away.name} @ ${away.price} | Casa: ${away.bookmaker}`,
-      "",
-      `Exemplo de divisão para ${formatMoneyBR(100)} total:`,
-      `- Mandante: ${formatMoneyBR(stakes.stakeHome)}`,
-      `- Empate: ${formatMoneyBR(stakes.stakeDraw)}`,
-      `- Visitante: ${formatMoneyBR(stakes.stakeAway)}`,
-      `Retorno garantido estimado: ${formatMoneyBR(stakes.retornoGarantido)}`,
-      `Lucro garantido estimado: ${formatMoneyBR(stakes.lucroGarantido)}`,
-      "",
-      "Observação: confirme a odd no momento da execução, pois a arbitragem pode desaparecer rapidamente.",
-      "",
-      "----------------------------------------",
-      "",
-    ].join("\n");
-  });
-
-  return texto.trim();
-}
-
-bot.onText(/\/start/, async (msg) => {
-  await bot.sendMessage(
+// =========================
+// TELEGRAM
+// =========================
+
+bot.onText(/\/start/, (msg) => {
+  bot.sendMessage(
     msg.chat.id,
-    [
-      "🤖 Tipster365 ativo.",
-      "",
-      "Comandos disponíveis:",
-      "/analise - escolher data ou período, depois a liga",
-      "/surebet - escolher data ou período, depois a liga",
-      "/cancelar - cancelar solicitação atual",
-      "",
-      "Formatos aceitos:",
-      "22/03/2026",
-      "22/03/2026 a 25/03/2026",
-    ].join("\n")
+    "🤖 Tipster ativo\n\nComandos:\n/scan - ranking global do dia"
   );
 });
 
-bot.onText(/\/cancelar/, async (msg) => {
-  pendingRequests.delete(msg.chat.id);
-  await bot.sendMessage(msg.chat.id, "✅ Solicitação cancelada.");
-});
-
-bot.onText(/\/analise/, async (msg) => {
-  pendingRequests.set(msg.chat.id, { type: "analise", step: "period" });
-  await bot.sendMessage(
-    msg.chat.id,
-    "📅 Me envie uma data ou período no formato:\n22/03/2026\nou\n22/03/2026 a 25/03/2026"
-  );
-});
-
-bot.onText(/\/surebet/, async (msg) => {
-  pendingRequests.set(msg.chat.id, { type: "surebet", step: "period" });
-  await bot.sendMessage(
-    msg.chat.id,
-    "📅 Me envie uma data ou período no formato:\n22/03/2026\nou\n22/03/2026 a 25/03/2026"
-  );
-});
-
-bot.on("message", async (msg) => {
+bot.onText(/\/scan/, async (msg) => {
   const chatId = msg.chat.id;
-  const text = (msg.text || "").trim();
-  const pending = pendingRequests.get(chatId);
 
-  if (!pending) return;
-  if (text.startsWith("/")) return;
+  await bot.sendMessage(chatId, "🌍 Escaneando todos os jogos...");
 
-  if (pending.step === "period") {
-    const parsed = parseBRDateOrRange(text);
+  try {
+    const resultado = await scanGlobal();
 
-    if (!parsed) {
-      await bot.sendMessage(
-        chatId,
-        "❌ Formato inválido.\nUse:\n22/03/2026\nou\n22/03/2026 a 25/03/2026"
-      );
-      return;
-    }
+    await bot.sendMessage(chatId, "🧠 Aplicando filtro de precisão...");
 
-    if (isPastPeriodBR(text)) {
-      await bot.sendMessage(
-        chatId,
-        "❌ O período informado começa no passado. Nesta versão simples, eu analiso apenas hoje ou datas futuras."
-      );
-      return;
-    }
+    const texto = formatarMensagem(resultado);
 
-    await bot.sendMessage(
-      chatId,
-      `⏳ Levantando ligas com jogos em ${parsed.label}...`
-    );
+    await sendLongMessage(chatId, texto);
 
-    try {
-      const leagueOptions = await buscarLigasComEventosNoPeriodo(text);
-
-      if (!leagueOptions.length) {
-        pendingRequests.delete(chatId);
-        await bot.sendMessage(
-          chatId,
-          `Nenhuma liga de futebol com jogos foi encontrada para ${parsed.label}.`
-        );
-        return;
-      }
-
-      pendingRequests.set(chatId, {
-        type: pending.type,
-        step: "league",
-        periodInput: text,
-        leagueOptions,
-      });
-
-      await bot.sendMessage(
-        chatId,
-        `✅ Encontrei ${leagueOptions.length} liga(s) com jogos em ${parsed.label}.`
-      );
-      await sendLeagueList(chatId, leagueOptions);
-    } catch (error) {
-      pendingRequests.delete(chatId);
-      console.error("ERRO_LISTA_LIGAS:", error);
-      await bot.sendMessage(
-        chatId,
-        "❌ Erro ao levantar as ligas do período informado. Veja os logs do Railway para o detalhe."
-      );
-    }
-
-    return;
-  }
-
-  if (pending.step === "league") {
-    const chosenLeague = getLeagueChoice(text, pending.leagueOptions || []);
-
-    if (!chosenLeague) {
-      await bot.sendMessage(
-        chatId,
-        "❌ Campeonato inválido. Responda com o número da lista."
-      );
-      return;
-    }
-
-    pendingRequests.delete(chatId);
-
-    const selectedSportKey = chosenLeague.key;
-    const selectedLeagueLabel = chosenLeague.label;
-    const selectedPeriodInput = pending.periodInput;
-    const periodData = parseBRDateOrRange(selectedPeriodInput);
-    const periodLabel = periodData?.label || selectedPeriodInput;
-
-    let odds = [];
-    let jogos = [];
-
-    try {
-      await bot.sendMessage(
-        chatId,
-        `⏳ Buscando jogos reais para ${periodLabel} em ${selectedLeagueLabel}...`
-      );
-
-      odds = await buscarOddsPorPeriodoBR(selectedPeriodInput, selectedSportKey, false);
-      jogos = resumirJogos(odds);
-
-      const totalEventosEncontrados = Array.isArray(odds) ? odds.length : 0;
-      const eventosAnalisados = Math.min(jogos.length, MAX_EVENTS_FOR_AI);
-
-      await bot.sendMessage(
-        chatId,
-        `📋 Encontrei ${totalEventosEncontrados} evento(s) no período.`
-      );
-
-      if (!jogos.length) {
-        await bot.sendMessage(
-          chatId,
-          `Nenhum jogo encontrado para ${periodLabel} em ${selectedLeagueLabel} (${selectedSportKey}).`
-        );
-        return;
-      }
-
-      jogos = jogos.slice(0, MAX_EVENTS_FOR_AI);
-
-      await bot.sendMessage(
-        chatId,
-        `🧠 Vou analisar ${eventosAnalisados} evento(s) para montar o resultado.`
-      );
-    } catch (error) {
-      console.error("ERRO_ODDS:", error);
-      await bot.sendMessage(
-        chatId,
-        "❌ Erro ao buscar os jogos do período informado. Veja os logs do Railway para o detalhe."
-      );
-      return;
-    }
-
-    if (pending.type === "surebet") {
-      try {
-        await bot.sendMessage(chatId, "🔎 Calculando surebets H2H...");
-
-        const surebets = jogos
-          .map(calcularSurebetH2H)
-          .filter(Boolean)
-          .sort((a, b) => b.margem - a.margem);
-
-        const textoSurebets = montarTextoSurebets(
-          surebets,
-          periodLabel,
-          selectedSportKey,
-          selectedLeagueLabel
-        );
-
-        await sendLongMessage(chatId, textoSurebets);
-      } catch (error) {
-        console.error("ERRO_SUREBET:", error);
-        await bot.sendMessage(
-          chatId,
-          "❌ Erro ao calcular surebets. Veja os logs do Railway para o detalhe."
-        );
-      }
-
-      return;
-    }
-
-    if (pending.type === "analise") {
-      try {
-        await bot.sendMessage(chatId, "🤖 Gerando análise com IA...");
-
-        const totalEventosEncontrados = Array.isArray(odds) ? odds.length : 0;
-        const eventosAnalisados = jogos.length;
-
-        const prompt = `
-Você é um analista profissional de apostas esportivas.
-
-Analise SOMENTE os dados reais fornecidos abaixo.
-Considere apenas os mercados H2H e OVER/UNDER gols.
-Não invente jogos, odds, linhas, horários, estatísticas externas ou contexto não fornecido.
-Se os dados forem insuficientes, diga isso claramente.
-
-Objetivo:
-Selecionar as melhores dicas de apostas do período solicitado com base em:
-- solidez do mercado
-- coerência entre linha e odd
-- favoritismo mais claro no H2H
-- linhas de gols mais consistentes no Over/Under
-- evitar entradas especulativas ou forçadas
-
-Regras obrigatórias:
-- Retorne no máximo 10 dicas.
-- Não force 10 dicas se o cenário não justificar.
-- Pode retornar menos, se forem as únicas realmente viáveis.
-- Evite repetir o mesmo jogo excessivamente.
-- Use no máximo 2 entradas por jogo.
-- Em OVER/UNDER, cite a linha explicitamente. Exemplo: Over 2.5 ou Under 2.5.
-- Ordene da melhor para a menos forte.
-- Não use justificativas genéricas como "odd interessante" ou "bom valor" sem explicar o motivo com base nos dados fornecidos.
-- Seja objetivo e específico.
-- Informe exatamente quantos eventos foram analisados para chegar ao resultado.
-
-Retorne exatamente neste formato:
-
-1. Período analisado
-2. Liga analisada
-3. Eventos encontrados no período
-4. Eventos analisados
-5. Resumo curto do cenário do período
-6. Top dicas do período
-
-Para cada dica, use exatamente:
-- Ranking:
-- Jogo:
-- Horário:
-- Mercado:
-- Entrada:
-- Odd:
-- Casa:
-- Justificativa curta:
-
-7. Observação final de risco
-
-Período analisado: ${periodLabel}
-Liga analisada: ${selectedLeagueLabel}
-Sport key: ${selectedSportKey}
-Eventos encontrados no período: ${totalEventosEncontrados}
-Eventos analisados: ${eventosAnalisados}
-
-Dados reais:
-${JSON.stringify(jogos, null, 2)}
-`;
-
-        const response = await client.responses.create({
-          model: "gpt-5.4",
-          input: prompt,
-        });
-
-        const textoResposta =
-          response.output_text || "Não foi possível gerar a análise.";
-
-        await sendLongMessage(chatId, textoResposta);
-      } catch (error) {
-        console.error("ERRO_OPENAI:", error);
-        await bot.sendMessage(
-          chatId,
-          "❌ Erro ao gerar a análise pela IA. Veja os logs do Railway para o detalhe."
-        );
-      }
-    }
+  } catch (e) {
+    console.log(e);
+    bot.sendMessage(chatId, "❌ Erro ao executar scan.");
   }
 });
 
-console.log("Bot iniciado com seleção de período + ligas com quantidade de eventos.");
+console.log("Bot rodando com SCAN GLOBAL + PRECISÃO...");
